@@ -1,0 +1,13 @@
+[Unit]
+Description=Attach USB devices from Pi on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/usb-boot-attach
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

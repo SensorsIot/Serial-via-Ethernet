@@ -1,0 +1,11 @@
+[Unit]
+Description=USB/IP Setup Portal
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/usbip-portal
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target

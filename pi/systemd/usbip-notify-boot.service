@@ -1,0 +1,12 @@
+[Unit]
+Description=Notify VM of USB devices on boot
+After=network-online.target usbipd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/notify-vm-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

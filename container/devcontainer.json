@@ -1,0 +1,17 @@
+{
+  "name": "USB/IP enabled container",
+  "runArgs": [
+    "--privileged",
+    "--device-cgroup-rule=c 166:* rwm",
+    "--device-cgroup-rule=c 188:* rwm",
+    "-v", "/dev:/dev:rslave"
+  ],
+  "remoteUser": "dev",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "platformio.platformio-ide"
+      ]
+    }
+  }
+}

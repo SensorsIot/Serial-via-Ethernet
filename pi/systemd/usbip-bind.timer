@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically bind USB devices
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=10
+
+[Install]
+WantedBy=timers.target

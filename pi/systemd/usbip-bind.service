@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind USB serial devices for USB/IP
+After=usbipd.service
+Requires=usbipd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/usbip-bind-all.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

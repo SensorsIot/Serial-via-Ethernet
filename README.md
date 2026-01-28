@@ -1,0 +1,215 @@
+# USB via Ethernet for Proxmox
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi-red.svg)](https://www.raspberrypi.org/)
+[![Proxmox](https://img.shields.io/badge/Proxmox-VM-orange.svg)](https://www.proxmox.com/)
+[![USB/IP](https://img.shields.io/badge/Protocol-USB%2FIP-blue.svg)](https://usbip.sourceforge.net/)
+
+> 🔌 Share USB devices from Raspberry Pi to Proxmox VMs over the network
+
+---
+
+## 🎯 Goal
+
+Enable containers running on Proxmox VMs to use USB serial devices (ESP32, Arduino, etc.) that are physically connected to a remote Raspberry Pi.
+
+**The connection must be:**
+
+- ✅ **Transparent** - Containers use `/dev/ttyUSB0` directly, no special commands
+- ✅ **Automatic** - Devices appear/disappear without manual intervention
+- ✅ **Reliable** - No blocking or stale connections when USB is unplugged
+
+## 💡 Solution
+
+A **push-based architecture** where the Raspberry Pi controls USB state:
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Container   │ ◄─── │   Proxmox    │ ◄─── │ Raspberry Pi │ ◄─── 🔌 USB
+│              │      │     VM       │      │              │
+│ /dev/ttyUSB0 │      │  USB/IP      │  SSH │  udev rules  │
+└──────────────┘      └──────────────┘      └──────────────┘
+```
+
+1. 📡 **Pi detects USB events** via udev rules
+2. 📤 **Pi notifies VM** via SSH when devices connect/disconnect
+3. ✔️ **Pi verifies** that VM successfully attached the device
+4. 🖥️ **Container sees** standard `/dev/ttyUSB*` devices
+
+The Pi is the single source of truth. It knows which devices are available and ensures the VM has them attached.
+
+## 🧩 Components
+
+| Component | Role |
+|-----------|------|
+| 🍓 **Raspberry Pi** | USB host, runs usbipd, detects events, notifies VM |
+| 💻 **Proxmox VM** | Receives notifications, manages USB/IP attachments |
+| 📦 **Container** | Uses serial devices directly via shared `/dev` |
+| 🌐 **Setup Portal** | Web UI on Pi for configuration (http://pi:8080) |
+
+## 🛠️ Technology
+
+- **USB/IP** - Linux kernel protocol to share USB over TCP/IP
+- **udev** - Detects USB connect/disconnect on Pi
+- **SSH** - Secure notification channel from Pi to VM
+
+---
+
+## 📁 Repository Structure
+
+```
+├── pi/                    # Raspberry Pi setup
+│   ├── scripts/           # Shell scripts
+│   ├── systemd/           # Service files
+│   ├── udev/              # udev rules
+│   └── portal.py          # Web portal
+├── vm/                    # Proxmox VM setup
+│   ├── scripts/           # Shell scripts
+│   └── systemd/           # Service files
+├── container/             # Container configuration
+│   └── devcontainer.json  # Example config
+└── docs/                  # Additional documentation
+```
+
+---
+
+## 🚀 Quick Start
+
+### 1️⃣ Setup Raspberry Pi
+
+```bash
+# Install USB/IP
+sudo apt update && sudo apt install usbip
+
+# Copy scripts
+sudo cp pi/scripts/* /usr/local/bin/
+sudo chmod +x /usr/local/bin/*.sh
+
+# Install services
+sudo cp pi/systemd/* /etc/systemd/system/
+sudo cp pi/udev/* /etc/udev/rules.d/
+
+# Enable services
+sudo systemctl daemon-reload
+sudo systemctl enable --now usbipd usbip-bind.timer usbip-portal
+```
+
+### 2️⃣ Setup Proxmox VM
+
+```bash
+# Install prerequisites
+sudo apt update
+sudo apt install linux-image-amd64 usbip avahi-daemon
+
+# Load kernel module
+sudo modprobe vhci_hcd
+echo "vhci_hcd" | sudo tee -a /etc/modules
+
+# Copy scripts
+sudo cp vm/scripts/* /usr/local/bin/
+sudo chmod +x /usr/local/bin/*
+
+# Install services
+sudo cp vm/systemd/* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable usb-boot-attach
+
+# Setup sudoers
+echo 'dev ALL=(root) NOPASSWD: /usr/sbin/usbip, /bin/fuser' | sudo tee /etc/sudoers.d/usbip
+```
+
+### 3️⃣ Configure via Web Portal
+
+1. Open **http://\<pi-ip\>:8080** in browser
+2. Enter VM IP address
+3. Click **Setup Pairing**
+4. Done! ✨
+
+---
+
+## 🌐 Setup Portal
+
+The Pi provides a web-based setup portal at **http://\<pi-ip\>:8080**
+
+### Features
+
+- 📊 **Status** - Shows current VM pairing
+- 🔌 **USB Devices** - Real-time attachment status
+  - 🟢 **attached** - Device connected to VM
+  - 🟡 **bound** - Device available but not attached
+- 🔍 **VM Discovery** - mDNS discovery of VMs
+- 🔗 **Test Connection** - Verify SSH connectivity
+- ⚡ **Setup Pairing** - One-click configuration
+- 🔄 **Attach All** - Attach any unattached devices
+
+---
+
+## 📋 Event Flow
+
+| Event | Pi Action | VM Action | Container Sees |
+|-------|-----------|-----------|----------------|
+| 🔌 USB plugged in | Bind, notify VM, verify | Attach device | `/dev/ttyUSB0` appears |
+| ⏏️ USB unplugged | Notify VM | Detach device | Device disappears |
+| 🔄 Pi reboots | Bind all, notify VM | Attach devices | Devices reappear |
+| 🔄 VM reboots | - | Query Pi, attach | Devices reappear |
+
+---
+
+## 📦 Container Usage
+
+With the push-based model, containers need no USB/IP commands. Devices appear automatically.
+
+```bash
+# Upload firmware to ESP32
+pio run -t upload
+
+# Monitor serial output
+pio device monitor
+
+# Upload and monitor
+pio run -t upload && pio device monitor
+```
+
+### devcontainer.json
+
+```json
+{
+  "runArgs": [
+    "--privileged",
+    "--device-cgroup-rule=c 166:* rwm",
+    "--device-cgroup-rule=c 188:* rwm",
+    "-v", "/dev:/dev:rslave"
+  ]
+}
+```
+
+---
+
+## 🔧 Supported Devices
+
+| Driver | Chip | Device |
+|--------|------|--------|
+| cp210x | Silicon Labs CP210x | /dev/ttyUSB* |
+| ch341 | QinHeng CH340/CH341 | /dev/ttyUSB* |
+| ftdi_sio | FTDI | /dev/ttyUSB* |
+| cdc_acm | CDC-ACM (Arduino) | /dev/ttyACM* |
+
+---
+
+## 💡 Tips
+
+- 🌐 Use Ethernet over Wi-Fi for reliability
+- 📏 Use short USB cables
+- 1️⃣ One Pi per VM for isolation
+
+---
+
+## 📄 License
+
+MIT License - feel free to use and modify!
+
+---
+
+## 🙏 Credits
+
+Developed for the [Sensors IoT](https://www.youtube.com/@AndreasSpiworst) community.
