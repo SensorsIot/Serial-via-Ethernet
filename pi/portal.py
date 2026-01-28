@@ -63,7 +63,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <h3>VM Configuration</h3>
         <div id="vm-list"><p>Scanning...</p></div>
         <p style="margin-top:15px"><strong>Or enter manually:</strong></p>
-        <input type="text" id="vm-input" placeholder="hostname or IP">
+        <input type="text" id="vm-input" placeholder="hostname or IP"><p style="margin-top:10px"><strong>Username:</strong></p><input type="text" id="vm-user" value="dev" placeholder="dev">
         <div style="margin-top:15px">
             <button onclick="testConnection()">Test Connection</button>
             <button onclick="setupPairing()" class="success">Setup Pairing</button>
@@ -93,8 +93,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const el = document.getElementById('status');
             if (data.vm_host) {
                 el.className = 'status connected';
-                el.innerHTML = '&#9679; Connected to <strong>' + data.vm_host + '</strong>';
+                el.innerHTML = '&#9679; Connected to <strong>' + data.vm_user + '@' + data.vm_host + '</strong>';
                 document.getElementById('vm-input').value = data.vm_host;
+                document.getElementById('vm-user').value = data.vm_user || 'dev';
                 selectedVm = data.vm_host;
             } else {
                 el.className = 'status disconnected';
@@ -131,18 +132,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             selectedVm = host;
         }
         function getVmHost() { return document.getElementById('vm-input').value.trim() || selectedVm; }
+        function getVmUser() { return document.getElementById('vm-user').value.trim() || 'dev'; }
         async function testConnection() {
             const host = getVmHost();
+            const user = getVmUser();
             if (!host) { log('Enter VM address'); return; }
-            log('Testing ' + host + '...');
-            const data = await api('test', 'POST', { host });
+            log('Testing ' + user + '@' + host + '...');
+            const data = await api('test', 'POST', { host, user });
             log(data.message);
         }
         async function setupPairing() {
             const host = getVmHost();
+            const user = getVmUser();
             if (!host) { log('Enter VM address'); return; }
-            log('Setting up ' + host + '...');
-            const data = await api('setup', 'POST', { host });
+            log('Setting up ' + user + '@' + host + '...');
+            const data = await api('setup', 'POST', { host, user });
             for (const msg of data.log || []) { log(msg); }
             log(data.success ? 'Setup complete!' : 'Failed: ' + data.error);
             loadStatus(); loadDevices();
@@ -321,10 +325,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(content_len)) if content_len else {}
         
         if path == '/api/test':
-            ok, msg = self.test_connection(body.get('host', ''))
+            ok, msg = self.test_connection(body.get('host', ''), body.get('user', 'dev'))
             self.send_json({'success': ok, 'message': f"{'OK' if ok else 'Failed'}: {msg}"})
         elif path == '/api/setup':
-            ok, msg, log = self.setup_pairing(body.get('host', ''))
+            ok, msg, log = self.setup_pairing(body.get('host', ''), body.get('user', 'dev'))
             self.send_json({'success': ok, 'error': msg if not ok else '', 'log': log})
         elif path == '/api/attach-all':
             ok, msg, log = self.attach_all()
