@@ -86,9 +86,10 @@ which esp_rfc2217_server.py
 git clone https://github.com/SensorsIot/Serial-via-Ethernet.git
 cd Serial-via-Ethernet/pi
 
-# Install portal
+# Install portal and serial proxy
 sudo cp portal.py /usr/local/bin/rfc2217-portal
-sudo chmod +x /usr/local/bin/rfc2217-portal
+sudo cp serial_proxy.py /usr/local/bin/serial-proxy
+sudo chmod +x /usr/local/bin/rfc2217-portal /usr/local/bin/serial-proxy
 
 # Install hotplug script
 sudo cp scripts/rfc2217-hotplug.sh /usr/local/bin/rfc2217-hotplug
@@ -97,6 +98,10 @@ sudo chmod +x /usr/local/bin/rfc2217-hotplug
 # Install udev rules
 sudo cp udev/99-rfc2217.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
+
+# Create log directory
+sudo mkdir -p /var/log/serial
+sudo chmod 755 /var/log/serial
 
 # Install systemd service
 sudo cp systemd/rfc2217-portal.service /etc/systemd/system/
@@ -532,6 +537,112 @@ curl http://localhost:8080/api/discover
 
 ---
 
+---
+
+## Part 8: Serial Logging
+
+All serial traffic is automatically logged with timestamps.
+
+### Log Location
+
+Logs are stored on the Pi at `/var/log/serial/`:
+
+```bash
+ls -la /var/log/serial/
+# FT232R_USB_UART_A5069RR4_2026-02-03.log
+# CP2102_USB_to_UART_0001_2026-02-03.log
+```
+
+### Log Format
+
+```
+[2026-02-03 19:32:00.154] [RX] ESP32 boot message here...
+[2026-02-03 19:32:00.258] [INFO] Baudrate changed to 115200
+[2026-02-03 19:32:00.711] [TX] Data sent to ESP32...
+[2026-02-03 19:32:00.826] [INFO] Client connected from 192.168.1.50:54321
+```
+
+- **[RX]** - Data received from ESP32
+- **[TX]** - Data sent to ESP32
+- **[INFO]** - Protocol events (baudrate changes, connections, etc.)
+
+### View Logs
+
+**On Pi:**
+```bash
+# Live tail
+tail -f /var/log/serial/*.log
+
+# Search for errors
+grep -i "error\|panic\|guru" /var/log/serial/*.log
+```
+
+**Via API:**
+```bash
+# List available logs
+curl http://PI_IP:8080/api/logs
+
+# Get last 100 lines of specific log
+curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=100"
+
+# Get last 500 lines
+curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=500"
+```
+
+### Log Rotation
+
+Logs rotate daily (new file per day). Old logs are not automatically deleted - manage manually or set up logrotate:
+
+```bash
+# /etc/logrotate.d/serial-proxy
+/var/log/serial/*.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+}
+```
+
+### Use Cases
+
+1. **AI Monitoring** - Parse logs for crash detection, memory warnings, WiFi issues
+2. **Debugging** - Review exact sequence of events leading to a problem
+3. **Audit Trail** - Record all commands sent to devices
+4. **Performance Analysis** - Analyze timing and response patterns
+
+---
+
+## Part 9: Flashing Without DTR/RTS
+
+If your USB-serial adapter doesn't have DTR/RTS connected to the ESP32's EN/BOOT pins, you'll need to manually enter bootloader mode.
+
+### Manual Bootloader Entry
+
+1. Press and hold the **BOOT** button on the ESP32
+2. Press and release the **RESET** button
+3. Release the **BOOT** button
+4. Run the flash command within 2-3 seconds:
+
+```bash
+esptool --port 'rfc2217://PI_IP:4001' write_flash 0x0 firmware.bin
+```
+
+### Monitoring Works Normally
+
+Serial monitoring works regardless of DTR/RTS:
+
+```python
+import serial
+ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
+while True:
+    line = ser.readline()
+    if line:
+        print(line.decode().strip())
+```
+
+---
+
 ## Quick Reference
 
 **Start/Stop servers:**
@@ -541,13 +652,19 @@ curl -X POST http://PI_IP:8080/api/start-all
 curl -X POST http://PI_IP:8080/api/stop-all
 
 # Manual
-esp_rfc2217_server.py -p 4001 /dev/ttyUSB0
-pkill -f esp_rfc2217_server
+serial-proxy -p 4001 -l /var/log/serial /dev/ttyUSB0
+pkill -f serial-proxy
 ```
 
 **Discover devices:**
 ```bash
 curl http://PI_IP:8080/api/discover
+```
+
+**View logs:**
+```bash
+curl http://PI_IP:8080/api/logs
+curl "http://PI_IP:8080/api/logs/DEVICE_DATE.log?lines=100"
 ```
 
 **Connect from Python:**
@@ -558,5 +675,9 @@ ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
 
 **Flash with esptool:**
 ```bash
+# With DTR/RTS auto-reset
 esptool --port 'rfc2217://PI_IP:4001?ign_set_control' write_flash 0x0 fw.bin
+
+# Without DTR/RTS (manual BOOT+RESET first)
+esptool --port 'rfc2217://PI_IP:4001' write_flash 0x0 fw.bin
 ```

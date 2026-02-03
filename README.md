@@ -5,7 +5,7 @@
 [![Proxmox](https://img.shields.io/badge/Proxmox-Containers-orange.svg)](https://www.proxmox.com/)
 [![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
 
-> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217
+> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217, with automatic logging of all serial traffic
 
 ---
 
@@ -319,6 +319,41 @@ Ports are assigned automatically in order of device detection. Check the web por
 
 ---
 
+## Serial Logging
+
+All serial traffic is automatically logged with timestamps to `/var/log/serial/` on the Pi.
+
+**Log file naming:**
+```
+FT232R_USB_UART_A5069RR4_2026-02-03.log
+CP2102_USB_to_UART_0001_2026-02-03.log
+```
+
+**Log format:**
+```
+[2026-02-03 19:32:00.154] [RX] Boot message from ESP32...
+[2026-02-03 19:32:00.258] [INFO] Baudrate changed to 115200
+[2026-02-03 19:32:00.711] [TX] Data sent to ESP32...
+```
+
+**View logs via API:**
+```bash
+# List all logs
+curl http://PI_IP:8080/api/logs
+
+# Get last 100 lines of a log
+curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=100"
+```
+
+**View logs on Pi:**
+```bash
+tail -f /var/log/serial/*.log
+```
+
+This allows AI monitoring, debugging, and post-mortem analysis of ESP32 behavior.
+
+---
+
 ## Troubleshooting
 
 ### Connection Refused
@@ -360,6 +395,7 @@ Only one client can connect at a time. Close other connections first.
 .
 ├── pi/
 │   ├── portal.py              # Web portal (auto-starts servers)
+│   ├── serial_proxy.py        # RFC2217 proxy with logging
 │   ├── scripts/
 │   │   └── rfc2217-hotplug.sh # Hotplug handler for udev
 │   ├── udev/
@@ -372,6 +408,8 @@ Only one client can connect at a time. Close other connections first.
 │   └── scripts/
 │       ├── discover.py        # Device discovery helper
 │       └── monitor.py         # Example serial monitor
+├── docs/
+│   └── Setup Guide.md         # Detailed setup documentation
 └── README.md                  # This file
 ```
 
