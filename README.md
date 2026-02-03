@@ -1,244 +1,391 @@
-# USB & Serial Sharing for Proxmox
+# ESP32 Serial Sharing via RFC2217
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi-red.svg)](https://www.raspberrypi.org/)
-[![Proxmox](https://img.shields.io/badge/Proxmox-VM-orange.svg)](https://www.proxmox.com/)
-[![USB/IP](https://img.shields.io/badge/Protocol-USB%2FIP-blue.svg)](https://usbip.sourceforge.net/)
+[![Proxmox](https://img.shields.io/badge/Proxmox-Containers-orange.svg)](https://www.proxmox.com/)
 [![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
 
-> Share USB devices and serial ports from Raspberry Pi to Proxmox VMs over the network
+> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217
 
 ---
 
-## 🎯 Goal
-
-Enable containers running on Proxmox VMs to use USB serial devices (ESP32, Arduino, etc.) that are physically connected to a remote Raspberry Pi.
-
-## 💡 Two Methods
-
-| Method | Best For | Complexity |
-|--------|----------|------------|
-| **USB/IP** | Any USB device (JTAG, HID, serial) | Higher (VM kernel modules) |
-| **RFC2217** | ESP32/Arduino serial only | Lower (userspace only) |
-
-### USB/IP Architecture
-
-Full USB device passthrough - VM sees device as locally connected with all USB descriptors.
+## Scenario
 
 ```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│  Container   │ ◄─── │   Proxmox    │ ◄─── │ Raspberry Pi │ ◄─── USB
-│              │      │     VM       │      │              │
-│ /dev/ttyUSB0 │      │  USB/IP      │  SSH │  udev rules  │
-└──────────────┘      └──────────────┘      └──────────────┘
+                                    Proxmox Host
+                                   ┌─────────────────────────────────┐
+┌──────────────┐                   │  VM                             │
+│ Raspberry Pi │                   │ ┌─────────────────────────────┐ │
+│    Zero      │    Network        │ │ Container A                 │ │
+│              │◄──────────────────┼─┤   rfc2217://pi:4001         │ │
+│ ESP32 #1 ────┼── Port 4001       │ │   (monitors ESP32 #1)       │ │
+│ ESP32 #2 ────┼── Port 4002       │ └─────────────────────────────┘ │
+│              │                   │ ┌─────────────────────────────┐ │
+│ Web Portal ──┼── Port 8080       │ │ Container B                 │ │
+│              │◄──────────────────┼─┤   rfc2217://pi:4002         │ │
+└──────────────┘                   │ │   (monitors ESP32 #2)       │ │
+                                   │ └─────────────────────────────┘ │
+                                   └─────────────────────────────────┘
 ```
 
-### RFC2217 Architecture
-
-Serial-over-TCP - simpler setup, no kernel modules needed on VM.
-
-```
-┌──────────────┐      ┌──────────────┐
-│  Container   │ ◄─── │ Raspberry Pi │ ◄─── USB
-│              │      │              │
-│  esptool     │ TCP  │  RFC2217     │
-│  rfc2217://  │ 4000 │  server      │
-└──────────────┘      └──────────────┘
-```
-
-## 🧩 Components
-
-| Component | Role |
-|-----------|------|
-| **Raspberry Pi** | USB host, web portal, USB/IP daemon or RFC2217 server |
-| **Proxmox VM** | USB/IP: receives notifications, attaches devices. RFC2217: not needed |
-| **Container** | USB/IP: uses `/dev/ttyUSB*`. RFC2217: uses `rfc2217://` URLs |
-| **Setup Portal** | Web UI on Pi for configuration (http://pi:8080) |
-
-## 🛠️ Technology
-
-- **USB/IP** - Linux kernel protocol to share USB over TCP/IP
-- **RFC2217** - Serial-over-TCP using esptool's RFC2217 server
-- **udev** - Detects USB connect/disconnect on Pi
+**Your setup:**
+- 2 ESP32 devices connected via USB to a Raspberry Pi Zero
+- Pi Zero connected to Proxmox network
+- VM running 2 containers
+- Each container uses one ESP32 via RFC2217
 
 ---
 
-## 📁 Repository Structure
+## Quick Start
 
-```
-├── pi/                    # Raspberry Pi setup
-│   ├── scripts/           # Shell scripts
-│   ├── systemd/           # Service files
-│   ├── udev/              # udev rules
-│   └── portal.py          # Web portal (supports USB/IP + RFC2217)
-├── vm/                    # Proxmox VM setup (USB/IP only)
-│   ├── scripts/           # Shell scripts
-│   └── systemd/           # Service files
-├── container/             # Container configuration
-│   └── devcontainer.json  # Example config
-├── alternatives/          # Alternative setups
-│   └── ser2net-rfc2217/   # Standalone RFC2217 with ser2net
-└── docs/                  # Detailed documentation
-```
-
----
-
-## 🚀 Quick Start
-
-### 1️⃣ Setup Raspberry Pi (Both Methods)
+### 1. Setup Raspberry Pi Zero
 
 ```bash
 # Install dependencies
-sudo apt update && sudo apt install usbip python3-pip
-pip3 install esptool  # For RFC2217 server
+sudo apt update && sudo apt install -y python3-pip curl
+sudo pip3 install esptool --break-system-packages
 
-# Copy scripts and portal
-sudo cp pi/scripts/* /usr/local/bin/
-sudo chmod +x /usr/local/bin/*.sh
-sudo cp pi/portal.py /usr/local/bin/usbip-portal
-sudo chmod +x /usr/local/bin/usbip-portal
+# Clone repo
+git clone https://github.com/YOUR_USER/USB-via-Ethernet.git
+cd USB-via-Ethernet/pi
 
-# Install services
-sudo cp pi/systemd/* /etc/systemd/system/
-sudo cp pi/udev/* /etc/udev/rules.d/
+# Install portal and scripts
+sudo cp portal.py /usr/local/bin/rfc2217-portal
+sudo cp scripts/rfc2217-hotplug.sh /usr/local/bin/rfc2217-hotplug
+sudo chmod +x /usr/local/bin/rfc2217-portal /usr/local/bin/rfc2217-hotplug
 
-# Enable services
+# Install udev rules (auto-start on device plug)
+sudo cp udev/99-rfc2217.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+
+# Install and enable service
+sudo cp systemd/rfc2217-portal.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now usbipd usbip-bind.timer usbip-portal
+sudo systemctl enable --now rfc2217-portal
 ```
 
-### 2️⃣ Setup Proxmox VM (USB/IP Only)
+### 2. Access Web Portal
 
-*Skip this step if using RFC2217 only.*
+Open **http://\<pi-ip\>:8080** in your browser.
+
+- See connected devices
+- Start/Stop RFC2217 servers
+- Copy connection URLs
+
+### 3. Connect from Containers
+
+**Option A: Auto-discovery (recommended)**
+
+```python
+# Use the included discover.py helper
+from discover import get_serial_connection
+
+# Container A gets first device
+ser = get_serial_connection("PI_IP", index=0)
+
+# Container B gets second device
+ser = get_serial_connection("PI_IP", index=1)
+
+while True:
+    line = ser.readline()
+    if line:
+        print(line.decode().strip())
+```
+
+**Option B: Query discovery API**
 
 ```bash
-# Install prerequisites
-sudo apt update
-sudo apt install linux-image-amd64 usbip avahi-daemon
-
-# Load kernel module
-sudo modprobe vhci_hcd
-echo "vhci_hcd" | sudo tee -a /etc/modules
-
-# Copy scripts
-sudo cp vm/scripts/* /usr/local/bin/
-sudo chmod +x /usr/local/bin/*
-
-# Install services
-sudo cp vm/systemd/* /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable usb-boot-attach
-
-# Setup sudoers
-echo 'dev ALL=(root) NOPASSWD: /usr/sbin/usbip, /bin/fuser' | sudo tee /etc/sudoers.d/usbip
+# Find available devices
+curl http://PI_IP:8080/api/discover
+# Returns: {"devices": [{"url": "rfc2217://192.168.1.100:4001", ...}, ...]}
 ```
 
-### 3️⃣ Configure via Web Portal
+**Option C: Direct URL (if you know the port)**
 
-1. Open **http://\<pi-ip\>:8080** in browser
-2. **For USB/IP**: Enter VM IP and click **Setup Pairing**
-3. **For RFC2217**: Select RFC2217 mode for each device - note the port number
+```python
+import serial
 
----
+# Container A (ESP32 #1 on port 4001)
+ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
 
-## 🌐 Setup Portal
-
-The Pi provides a web-based setup portal at **http://\<pi-ip\>:8080**
-
-### Features
-
-- **Status** - Shows current VM pairing (USB/IP)
-- **USB Devices** - Real-time list with mode selection per device
-  - Select USB/IP or RFC2217 mode for each device
-  - See attachment status and RFC2217 port numbers
-- **VM Discovery** - mDNS discovery of VMs (USB/IP)
-- **Test Connection** - Verify SSH connectivity (USB/IP)
-- **Setup Pairing** - One-click configuration (USB/IP)
+# Container B (ESP32 #2 on port 4002)
+ser = serial.serial_for_url("rfc2217://PI_IP:4002", baudrate=115200)
+```
 
 ---
 
-## 📋 Event Flow (USB/IP)
+## Container Setup
 
-| Event | Pi Action | VM Action | Container Sees |
-|-------|-----------|-----------|----------------|
-| USB plugged in | Bind, notify VM, verify | Attach device | `/dev/ttyUSB0` appears |
-| USB unplugged | Notify VM | Detach device | Device disappears |
-| Pi reboots | Bind all, notify VM | Attach devices | Devices reappear |
-| VM reboots | - | Query Pi, attach | Devices reappear |
+### Docker
 
-For **RFC2217**, devices are available immediately when connected to the Pi. No VM setup or pairing needed - just connect to the TCP port.
+```yaml
+# docker-compose.yml
+services:
+  esp32-monitor-a:
+    image: python:3.11-slim
+    command: python /app/monitor.py
+    volumes:
+      - ./monitor.py:/app/monitor.py
+    environment:
+      - ESP32_PORT=rfc2217://PI_IP:4001
+    network_mode: bridge
 
----
+  esp32-monitor-b:
+    image: python:3.11-slim
+    command: python /app/monitor.py
+    volumes:
+      - ./monitor.py:/app/monitor.py
+    environment:
+      - ESP32_PORT=rfc2217://PI_IP:4002
+    network_mode: bridge
+```
 
-## 📦 Container Usage
+### LXC Container
 
-### USB/IP Mode
-
-Devices appear as `/dev/ttyUSB*` automatically.
+No special configuration needed. Just install pyserial:
 
 ```bash
-pio run -t upload
-pio device monitor
+apt update && apt install -y python3-pip
+pip3 install pyserial
 ```
 
-**devcontainer.json:**
+### DevContainer (VS Code)
+
 ```json
 {
-  "runArgs": [
-    "--privileged",
-    "--device-cgroup-rule=c 166:* rwm",
-    "--device-cgroup-rule=c 188:* rwm",
-    "-v", "/dev:/dev:rslave"
-  ]
+  "name": "ESP32 Dev",
+  "image": "python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+  "postCreateCommand": "pip install pyserial esptool"
 }
 ```
 
-### RFC2217 Mode
+---
 
-Connect directly to the RFC2217 URL.
+## Usage Examples
+
+### Python with pyserial
+
+```python
+import serial
+import os
+
+PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.1.100:4001')
+ser = serial.serial_for_url(PORT, baudrate=115200, timeout=1)
+
+# Read serial data
+while True:
+    line = ser.readline()
+    if line:
+        text = line.decode('utf-8', errors='replace').strip()
+        print(text)
+
+        # Simple AI-like monitoring
+        if 'Guru Meditation' in text or 'Backtrace:' in text:
+            print("ALERT: Crash detected!")
+        if 'heap' in text.lower() and 'free' in text.lower():
+            # Parse heap info
+            pass
+```
+
+### esptool (Flashing)
 
 ```bash
-# esptool
-esptool --no-stub --port 'rfc2217://192.168.0.87:4000?ign_set_control' flash_id
+# Flash firmware
+esptool --port 'rfc2217://PI_IP:4001?ign_set_control' \
+    write_flash 0x0 firmware.bin
 
-# ESP-IDF
-export ESPPORT='rfc2217://192.168.0.87:4000?ign_set_control'
+# Read chip info
+esptool --port 'rfc2217://PI_IP:4001?ign_set_control' chip_id
+```
+
+### PlatformIO
+
+```ini
+; platformio.ini
+[env:esp32]
+platform = espressif32
+board = esp32dev
+upload_port = rfc2217://PI_IP:4001?ign_set_control
+monitor_port = rfc2217://PI_IP:4001?ign_set_control
+```
+
+### ESP-IDF
+
+```bash
+export ESPPORT='rfc2217://PI_IP:4001?ign_set_control'
 idf.py flash monitor
 ```
 
-**platformio.ini:**
-```ini
-upload_port = rfc2217://192.168.0.87:4000?ign_set_control
-monitor_port = rfc2217://192.168.0.87:4000?ign_set_control
+### Local /dev/tty via socat
+
+If your tool requires a local device path:
+
+```bash
+# In the container
+apt install -y socat
+
+# Create virtual serial port
+socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:PI_IP:4001 &
+
+# Now use /dev/ttyESP32 as normal
+cat /dev/ttyESP32
 ```
 
 ---
 
-## 🔧 Supported Devices
+## AI Monitoring Example
 
-| Driver | Chip | Device |
-|--------|------|--------|
-| cp210x | Silicon Labs CP210x | /dev/ttyUSB* |
-| ch341 | QinHeng CH340/CH341 | /dev/ttyUSB* |
-| ftdi_sio | FTDI | /dev/ttyUSB* |
-| cdc_acm | CDC-ACM (Arduino) | /dev/ttyACM* |
+```python
+#!/usr/bin/env python3
+"""ESP32 AI Monitor - Detect patterns and alert on issues"""
+
+import serial
+import json
+import re
+import os
+from datetime import datetime
+
+PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.1.100:4001')
+
+# Alert patterns
+PATTERNS = {
+    'crash': [r'Guru Meditation', r'Backtrace:', r'assert failed'],
+    'memory': [r'heap.*free.*(\d+)', r'MALLOC_CAP'],
+    'wifi': [r'WIFI.*DISCONNECT', r'wifi:.*reason'],
+    'boot': [r'rst:.*boot:', r'configsip:'],
+}
+
+def analyze_line(line):
+    """Analyze a line for patterns"""
+    alerts = []
+    for category, patterns in PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                alerts.append({
+                    'category': category,
+                    'pattern': pattern,
+                    'line': line,
+                    'timestamp': datetime.now().isoformat()
+                })
+    return alerts
+
+def main():
+    print(f"Connecting to {PORT}...")
+    ser = serial.serial_for_url(PORT, baudrate=115200, timeout=1)
+    print("Connected. Monitoring...")
+
+    while True:
+        try:
+            line = ser.readline()
+            if not line:
+                continue
+
+            text = line.decode('utf-8', errors='replace').strip()
+            if not text:
+                continue
+
+            # Print the line
+            print(text)
+
+            # Analyze for alerts
+            alerts = analyze_line(text)
+            for alert in alerts:
+                print(f"\n*** ALERT [{alert['category']}] ***")
+                print(json.dumps(alert, indent=2))
+                print()
+
+        except Exception as e:
+            print(f"Error: {e}")
+            break
+
+if __name__ == '__main__':
+    main()
+```
 
 ---
 
-## 💡 Tips
+## Port Assignment
 
-- 🌐 Use Ethernet over Wi-Fi for reliability
-- 📏 Use short USB cables
-- 1️⃣ One Pi per VM for isolation
+| Port | Device |
+|------|--------|
+| 4001 | First ESP32 |
+| 4002 | Second ESP32 |
+| 4003+ | Additional devices |
+
+Ports are assigned automatically in order of device detection. Check the web portal for current assignments.
 
 ---
 
-## 📄 License
+## Troubleshooting
+
+### Connection Refused
+
+```bash
+# Check if server is running on Pi
+ss -tlnp | grep 400
+
+# Start via portal or manually
+esp_rfc2217_server.py -p 4001 /dev/ttyUSB0
+```
+
+### Device Not Detected
+
+```bash
+# On Pi, check USB devices
+ls -la /dev/ttyUSB* /dev/ttyACM*
+
+# Check dmesg for USB events
+dmesg | tail -20
+```
+
+### Timeout During Flash
+
+Use `--no-stub` flag:
+```bash
+esptool --no-stub --port 'rfc2217://PI_IP:4001?ign_set_control' flash_id
+```
+
+### Port Busy
+
+Only one client can connect at a time. Close other connections first.
+
+---
+
+## Files
+
+```
+.
+├── pi/
+│   ├── portal.py              # Web portal (auto-starts servers)
+│   ├── scripts/
+│   │   └── rfc2217-hotplug.sh # Hotplug handler for udev
+│   ├── udev/
+│   │   └── 99-rfc2217.rules   # Auto-start on device plug
+│   └── systemd/
+│       └── rfc2217-portal.service
+├── container/
+│   ├── README.md              # Container setup guide
+│   ├── devcontainer.json      # VS Code devcontainer
+│   └── scripts/
+│       ├── discover.py        # Device discovery helper
+│       └── monitor.py         # Example serial monitor
+└── README.md                  # This file
+```
+
+---
+
+## Network Requirements
+
+| Port | Direction | Purpose |
+|------|-----------|---------|
+| 8080 | Browser -> Pi | Web portal |
+| 4001+ | Container -> Pi | RFC2217 serial |
+
+---
+
+## License
 
 MIT License - feel free to use and modify!
-
----
-
-## 🙏 Credits
-
-Developed for the [Sensors IoT](https://www.youtube.com/@AndreasSpiworst) community.

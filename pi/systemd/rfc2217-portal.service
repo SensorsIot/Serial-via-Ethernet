@@ -1,9 +1,9 @@
 [Unit]
-Description=USB/IP Setup Portal
+Description=RFC2217 Serial Portal
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/usbip-portal
+ExecStart=/usr/bin/python3 /usr/local/bin/rfc2217-portal
 Restart=on-failure
 User=root
 

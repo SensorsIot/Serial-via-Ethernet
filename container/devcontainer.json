@@ -1,17 +1,22 @@
 {
-  "name": "USB/IP enabled container",
-  "runArgs": [
-    "--privileged",
-    "--device-cgroup-rule=c 166:* rwm",
-    "--device-cgroup-rule=c 188:* rwm",
-    "-v", "/dev:/dev:rslave"
-  ],
-  "remoteUser": "dev",
+  "name": "ESP32 Development (RFC2217)",
+  "image": "python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+  "postCreateCommand": "pip install pyserial esptool platformio",
   "customizations": {
     "vscode": {
       "extensions": [
-        "platformio.platformio-ide"
-      ]
+        "platformio.platformio-ide",
+        "ms-python.python"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
     }
+  },
+  "remoteEnv": {
+    "ESP32_PORT": "rfc2217://PI_IP:4001?ign_set_control"
   }
 }
