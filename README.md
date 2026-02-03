@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi-red.svg)](https://www.raspberrypi.org/)
 [![Proxmox](https://img.shields.io/badge/Proxmox-VM-orange.svg)](https://www.proxmox.com/)
+[![USB/IP](https://img.shields.io/badge/Protocol-USB%2FIP-blue.svg)](https://usbip.sourceforge.net/)
+[![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
 
 > Share USB devices and serial ports from Raspberry Pi to Proxmox VMs over the network
 
