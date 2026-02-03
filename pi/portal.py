@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 PORT = 8080
 CONFIG_FILE = "/etc/rfc2217/devices.conf"
+LOG_DIR = "/var/log/serial"
 RFC2217_BASE_PORT = 4001  # Start from 4001, one port per device
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -272,29 +273,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return info
 
     def get_running_servers(self):
-        """Get running esp_rfc2217_server processes: {tty: {port, pid}}"""
+        """Get running serial proxy or esp_rfc2217_server processes: {tty: {port, pid}}"""
         servers = {}
-        try:
-            result = subprocess.run(['pgrep', '-a', '-f', 'esp_rfc2217_server'],
-                capture_output=True, text=True)
-            for line in result.stdout.strip().split('\n'):
-                if not line:
-                    continue
-                parts = line.split()
-                pid = int(parts[0])
-                # Parse args: esp_rfc2217_server -p PORT TTY
-                port = None
-                tty = None
-                for i, arg in enumerate(parts):
-                    if arg == '-p' and i+1 < len(parts):
-                        try:
-                            port = int(parts[i+1])
-                        except: pass
-                    if arg.startswith('/dev/tty'):
-                        tty = arg
-                if tty and port:
-                    servers[tty] = {'port': port, 'pid': pid}
-        except: pass
+        # Check for both serial_proxy and esp_rfc2217_server
+        for pattern in ['serial.proxy', 'serial_proxy', 'esp_rfc2217_server']:
+            try:
+                result = subprocess.run(['pgrep', '-a', '-f', pattern],
+                    capture_output=True, text=True)
+                for line in result.stdout.strip().split('\n'):
+                    if not line:
+                        continue
+                    parts = line.split()
+                    pid = int(parts[0])
+                    # Parse args: -p PORT ... TTY
+                    port = None
+                    tty = None
+                    for i, arg in enumerate(parts):
+                        if arg == '-p' and i+1 < len(parts):
+                            try:
+                                port = int(parts[i+1])
+                            except: pass
+                        if arg.startswith('/dev/tty'):
+                            tty = arg
+                    if tty and port:
+                        servers[tty] = {'port': port, 'pid': pid}
+            except: pass
         return servers
 
     def assign_port(self, tty, config):
@@ -312,7 +315,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return port
 
     def start_server(self, tty):
-        """Start RFC2217 server for device"""
+        """Start serial proxy with logging for device"""
         config = self.read_config()
         port = self.assign_port(tty, config)
 
@@ -321,42 +324,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if tty in running:
             return True, f"Already running on port {running[tty]['port']}"
 
-        # Find esp_rfc2217_server
+        # Find serial_proxy or fall back to esp_rfc2217_server
         server_paths = [
+            '/usr/local/bin/serial-proxy',
+            '/usr/local/bin/serial_proxy.py',
             '/usr/local/bin/esp_rfc2217_server',
             '/usr/local/bin/esp_rfc2217_server.py',
             os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
-            '/usr/bin/esp_rfc2217_server.py'
         ]
 
         server_cmd = None
+        use_proxy = False
         for path in server_paths:
             if os.path.exists(path):
                 server_cmd = path
+                use_proxy = 'proxy' in path
                 break
 
         if not server_cmd:
-            # Try to find via which
-            try:
-                result = subprocess.run(['which', 'esp_rfc2217_server.py'],
-                    capture_output=True, text=True)
-                if result.returncode == 0:
-                    server_cmd = result.stdout.strip()
-            except: pass
-
-        if not server_cmd:
-            return False, "esp_rfc2217_server not found. Run: pip3 install esptool"
+            return False, "serial_proxy not found"
 
         try:
-            proc = subprocess.Popen(
-                [server_cmd, '-p', str(port), tty],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
+            # Create log directory
+            os.makedirs(LOG_DIR, exist_ok=True)
+
+            if use_proxy:
+                proc = subprocess.Popen(
+                    [server_cmd, '-p', str(port), '-l', LOG_DIR, tty],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+            else:
+                proc = subprocess.Popen(
+                    [server_cmd, '-p', str(port), tty],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+
             time.sleep(0.5)  # Give it time to start
 
             # Verify it's running
             if proc.poll() is None:
-                return True, f"Started on port {port}"
+                msg = f"Started on port {port}"
+                if use_proxy:
+                    msg += f" (logging to {LOG_DIR})"
+                return True, msg
             else:
                 return False, "Server exited immediately"
         except Exception as e:
@@ -418,6 +428,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         'tty': d['tty']
                     })
             self.send_json({'devices': urls})
+        elif path == '/api/logs':
+            # List available log files
+            logs = []
+            if os.path.exists(LOG_DIR):
+                for f in sorted(os.listdir(LOG_DIR), reverse=True):
+                    if f.endswith('.log'):
+                        fpath = os.path.join(LOG_DIR, f)
+                        logs.append({
+                            'name': f,
+                            'size': os.path.getsize(fpath),
+                            'modified': os.path.getmtime(fpath)
+                        })
+            self.send_json({'logs': logs})
+        elif path.startswith('/api/logs/'):
+            # Get log content
+            log_name = path[len('/api/logs/'):]
+            log_path = os.path.join(LOG_DIR, log_name)
+            if os.path.exists(log_path) and log_path.startswith(LOG_DIR):
+                # Get optional tail parameter from query string
+                query = urlparse(self.path).query
+                lines = 100  # Default
+                for param in query.split('&'):
+                    if param.startswith('lines='):
+                        try:
+                            lines = int(param.split('=')[1])
+                        except: pass
+                try:
+                    with open(log_path, 'r') as f:
+                        all_lines = f.readlines()
+                        content = ''.join(all_lines[-lines:])
+                    self.send_json({'content': content, 'total_lines': len(all_lines)})
+                except Exception as e:
+                    self.send_json({'error': str(e)}, 500)
+            else:
+                self.send_json({'error': 'Log not found'}, 404)
         else:
             self.send_json({'error': 'Not found'}, 404)
 
@@ -469,7 +514,7 @@ def get_serial_devices_standalone():
     return devices
 
 def start_server_standalone(tty, config_file=CONFIG_FILE):
-    """Start RFC2217 server for device (standalone function)"""
+    """Start serial proxy with logging for device (standalone function)"""
     # Read config
     config = {}
     if os.path.exists(config_file):
@@ -499,42 +544,49 @@ def start_server_standalone(tty, config_file=CONFIG_FILE):
 
     # Check if already running
     try:
-        result = subprocess.run(['pgrep', '-a', '-f', 'esp_rfc2217_server'],
-            capture_output=True, text=True)
-        if tty in result.stdout:
-            return True, f"Already running on port {port}"
+        for pattern in ['serial.proxy', 'serial_proxy', 'esp_rfc2217_server']:
+            result = subprocess.run(['pgrep', '-a', '-f', pattern],
+                capture_output=True, text=True)
+            if tty in result.stdout:
+                return True, f"Already running on port {port}"
     except: pass
 
-    # Find server command
+    # Find server command (prefer serial_proxy for logging)
     server_paths = [
+        '/usr/local/bin/serial-proxy',
+        '/usr/local/bin/serial_proxy.py',
         '/usr/local/bin/esp_rfc2217_server',
         '/usr/local/bin/esp_rfc2217_server.py',
         os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
-        '/usr/bin/esp_rfc2217_server.py'
     ]
     server_cmd = None
+    use_proxy = False
     for path in server_paths:
         if os.path.exists(path):
             server_cmd = path
+            use_proxy = 'proxy' in path
             break
-    if not server_cmd:
-        try:
-            result = subprocess.run(['which', 'esp_rfc2217_server.py'],
-                capture_output=True, text=True)
-            if result.returncode == 0:
-                server_cmd = result.stdout.strip()
-        except: pass
 
     if not server_cmd:
-        return False, "esp_rfc2217_server not found"
+        return False, "serial_proxy not found"
+
+    # Create log directory
+    os.makedirs(LOG_DIR, exist_ok=True)
 
     # Start server
     try:
-        subprocess.Popen(
-            [server_cmd, '-p', str(port), tty],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
-        return True, f"Started on port {port}"
+        if use_proxy:
+            subprocess.Popen(
+                [server_cmd, '-p', str(port), '-l', LOG_DIR, tty],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            return True, f"Started on port {port} (logging)"
+        else:
+            subprocess.Popen(
+                [server_cmd, '-p', str(port), tty],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            return True, f"Started on port {port}"
     except Exception as e:
         return False, str(e)
 
