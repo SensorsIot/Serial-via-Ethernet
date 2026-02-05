@@ -21,7 +21,11 @@ from urllib.parse import urlparse
 
 PORT = 8080
 CONFIG_FILE = os.environ.get("RFC2217_CONFIG", "/etc/rfc2217/slots.json")
-PROXY_PATHS = ["/usr/local/bin/serial_proxy.py", "/usr/local/bin/serial-proxy"]
+PROXY_PATHS = [
+    "/usr/local/bin/esp_rfc2217_server.py",
+    "/usr/local/bin/serial_proxy.py",
+    "/usr/local/bin/serial-proxy",
+]
 LOG_DIR = "/var/log/serial"
 
 # Module-level state
@@ -289,6 +293,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_get_devices()
         elif path == "/api/info":
             self._handle_get_info()
+        elif path in ("/", "/index.html"):
+            self._serve_ui()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -442,6 +448,138 @@ class Handler(http.server.BaseHTTPRequestHandler):
             stop_proxy(slot)
         self._send_json({"ok": True, "slot_key": slot_key, "running": False})
 
+    def _serve_ui(self):
+        html = _UI_HTML
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+_UI_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFC2217 Serial Portal</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        h1 { text-align: center; margin-bottom: 30px; color: #00d4ff; }
+        .slots {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px; max-width: 1000px; margin: 0 auto;
+        }
+        .slot {
+            background: #16213e; border-radius: 12px; padding: 20px;
+            border: 2px solid #0f3460; transition: all 0.3s;
+        }
+        .slot.running { border-color: #00d4ff; box-shadow: 0 0 20px rgba(0,212,255,0.2); }
+        .slot.present { border-color: #555; }
+        .slot-header {
+            display: flex; justify-content: space-between;
+            align-items: center; margin-bottom: 15px;
+        }
+        .slot-label { font-size: 1.4em; font-weight: bold; }
+        .status {
+            padding: 4px 12px; border-radius: 20px;
+            font-size: 0.85em; font-weight: bold;
+        }
+        .status.running { background: #00d4ff; color: #1a1a2e; }
+        .status.present { background: #555; color: #ccc; }
+        .status.stopped { background: #333; color: #666; }
+        .slot-info { font-size: 0.9em; color: #aaa; margin-bottom: 15px; }
+        .slot-info div { margin: 5px 0; }
+        .slot-info span { color: #00d4ff; font-family: monospace; }
+        .url-box {
+            background: #0f3460; padding: 10px; border-radius: 8px;
+            font-family: monospace; font-size: 0.9em;
+            word-break: break-all; cursor: pointer; transition: background 0.2s;
+        }
+        .url-box:hover { background: #1a4a7a; }
+        .url-box.empty { color: #666; cursor: default; }
+        .copied { background: #00d4ff !important; color: #1a1a2e !important; }
+        .error { color: #ff6b6b; font-size: 0.85em; margin-top: 10px; }
+        .info { text-align: center; color: #666; margin-top: 30px; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <h1>RFC2217 Serial Portal</h1>
+    <div class="slots" id="slots"></div>
+    <div class="info" id="info">Auto-refresh every 2 seconds</div>
+<script>
+async function fetchDevices() {
+    try {
+        const resp = await fetch('/api/devices');
+        const data = await resp.json();
+        renderSlots(data.slots);
+        document.getElementById('info').textContent =
+            'Host: ' + data.host_ip + '  |  Auto-refresh every 2s';
+    } catch (e) {
+        console.error('Error fetching devices:', e);
+    }
+}
+
+function slotStatus(s) {
+    if (s.running) return 'running';
+    if (s.present) return 'present';
+    return 'stopped';
+}
+function statusLabel(s) {
+    if (s.running) return 'RUNNING';
+    if (s.present) return 'PRESENT';
+    return 'EMPTY';
+}
+
+function renderSlots(slots) {
+    const el = document.getElementById('slots');
+    el.innerHTML = slots.map(s => {
+        const st = slotStatus(s);
+        const label = s.label || s.slot_key.slice(-20);
+        return `
+        <div class="slot ${st}">
+            <div class="slot-header">
+                <div class="slot-label">${label}</div>
+                <div class="status ${st}">${statusLabel(s)}</div>
+            </div>
+            <div class="slot-info">
+                <div>Port: <span>${s.tcp_port || '-'}</span></div>
+                <div>Device: <span>${s.devnode || 'None'}</span></div>
+                ${s.pid ? '<div>PID: <span>' + s.pid + '</span></div>' : ''}
+            </div>
+            <div class="url-box ${s.running ? '' : 'empty'}"
+                 onclick="${s.running ? "copyUrl('" + s.url + "',this)" : ''}">
+                ${s.running ? s.url : (s.present ? 'Device present, proxy not running' : 'No device connected')}
+            </div>
+            ${s.last_error ? '<div class="error">Error: ' + s.last_error + '</div>' : ''}
+        </div>`;
+    }).join('');
+}
+
+function copyUrl(url, el) {
+    navigator.clipboard.writeText(url);
+    el.classList.add('copied');
+    el.textContent = 'Copied!';
+    setTimeout(() => { el.classList.remove('copied'); el.textContent = url; }, 1000);
+}
+
+fetchDevices();
+setInterval(fetchDevices, 2000);
+</script>
+</body>
+</html>
+"""
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -461,8 +599,8 @@ def main():
     os.makedirs(LOG_DIR, exist_ok=True)
 
     addr = ("", PORT)
+    http.server.HTTPServer.allow_reuse_address = True
     httpd = http.server.HTTPServer(addr, Handler)
-    httpd.allow_reuse_address = True
     print(
         f"[portal] v3 listening on http://0.0.0.0:{PORT}  host_ip={host_ip}",
         flush=True,

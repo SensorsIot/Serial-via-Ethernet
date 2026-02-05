@@ -6,6 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== Installing RFC2217 Portal v3 ==="
 
+# Install dependencies
+echo "Installing dependencies..."
+sudo apt-get install -y python3-serial python3-pip
+sudo pip3 install esptool --break-system-packages 2>/dev/null || true
+
 # Create directories
 echo "Creating directories..."
 sudo mkdir -p /etc/rfc2217

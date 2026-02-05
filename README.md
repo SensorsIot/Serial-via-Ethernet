@@ -4,12 +4,13 @@
 [![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi-red.svg)](https://www.raspberrypi.org/)
 [![Proxmox](https://img.shields.io/badge/Proxmox-Containers-orange.svg)](https://www.proxmox.com/)
 [![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 
-> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217, with automatic logging of all serial traffic
+> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217. Slot-based device management with automatic proxy supervision and serial traffic logging.
 
 ---
 
-## Scenario
+## 📡 Scenario
 
 ```
                                     Proxmox Host
@@ -36,35 +37,29 @@
 
 ---
 
-## Quick Start
+## ⚡ Quick Start
 
 ### 1. Setup Raspberry Pi Zero
 
 ```bash
-# Install dependencies
-sudo apt update && sudo apt install -y python3-pip curl
-sudo pip3 install esptool --break-system-packages
-
-# Clone repo
 git clone https://github.com/SensorsIot/Serial-via-Ethernet.git
 cd Serial-via-Ethernet/pi
-
-# Install portal and scripts
-sudo cp portal.py /usr/local/bin/rfc2217-portal
-sudo cp scripts/rfc2217-hotplug.sh /usr/local/bin/rfc2217-hotplug.sh
-sudo chmod +x /usr/local/bin/rfc2217-portal /usr/local/bin/rfc2217-hotplug.sh
-
-# Install udev rules (auto-start on device plug)
-sudo cp udev/99-rfc2217.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-
-# Install and enable service
-sudo cp systemd/rfc2217-portal.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rfc2217-portal
+bash install.sh
 ```
 
-### 2. Access Web Portal
+After installation, discover your USB port slots and generate the configuration:
+
+```bash
+rfc2217-learn-slots
+```
+
+Review and edit the slot configuration as needed:
+
+```bash
+sudo nano /etc/rfc2217/slots.json
+```
+
+### 2. 🖥️ Access Web Portal
 
 Open **http://\<pi-ip\>:8080** in your browser.
 
@@ -74,47 +69,29 @@ Open **http://\<pi-ip\>:8080** in your browser.
 
 ### 3. Connect from Containers
 
-**Option A: Auto-discovery (recommended)**
-
-```python
-# Use the included discover.py helper
-from discover import get_serial_connection
-
-# Container A gets first device
-ser = get_serial_connection("PI_IP", index=0)
-
-# Container B gets second device
-ser = get_serial_connection("PI_IP", index=1)
-
-while True:
-    line = ser.readline()
-    if line:
-        print(line.decode().strip())
-```
-
-**Option B: Query discovery API**
+**Option A: Query the devices API**
 
 ```bash
-# Find available devices
-curl http://PI_IP:8080/api/discover
-# Returns: {"devices": [{"url": "rfc2217://192.168.1.100:4001", ...}, ...]}
+# List all configured slots and their status
+curl http://PI_IP:8080/api/devices
+# Returns: {"slots": [{"label": "ESP32-A", "tcp_port": 4001, "running": true, ...}, ...]}
 ```
 
-**Option C: Direct URL (if you know the port)**
+**Option B: Direct URL (slot-based ports)**
 
 ```python
 import serial
 
-# Container A (ESP32 #1 on port 4001)
+# Container A (Slot 1 — port 4001)
 ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
 
-# Container B (ESP32 #2 on port 4002)
+# Container B (Slot 2 — port 4002)
 ser = serial.serial_for_url("rfc2217://PI_IP:4002", baudrate=115200)
 ```
 
 ---
 
-## Container Setup
+## 🔌 Container Setup
 
 ### Docker
 
@@ -127,7 +104,7 @@ services:
     volumes:
       - ./monitor.py:/app/monitor.py
     environment:
-      - ESP32_PORT=rfc2217://PI_IP:4001
+      - ESP32_PORT=rfc2217://PI_IP:4001?ign_set_control
     network_mode: bridge
 
   esp32-monitor-b:
@@ -136,7 +113,7 @@ services:
     volumes:
       - ./monitor.py:/app/monitor.py
     environment:
-      - ESP32_PORT=rfc2217://PI_IP:4002
+      - ESP32_PORT=rfc2217://PI_IP:4002?ign_set_control
     network_mode: bridge
 ```
 
@@ -164,7 +141,7 @@ pip3 install pyserial
 
 ---
 
-## Usage Examples
+## 🛠️ Usage Examples
 
 ### Python with pyserial
 
@@ -172,7 +149,7 @@ pip3 install pyserial
 import serial
 import os
 
-PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.1.100:4001')
+PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.0.87:4001?ign_set_control')
 ser = serial.serial_for_url(PORT, baudrate=115200, timeout=1)
 
 # Read serial data
@@ -236,7 +213,7 @@ cat /dev/ttyESP32
 
 ---
 
-## AI Monitoring Example
+## 🤖 AI Monitoring Example
 
 ```python
 #!/usr/bin/env python3
@@ -248,7 +225,7 @@ import re
 import os
 from datetime import datetime
 
-PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.1.100:4001')
+PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.0.87:4001?ign_set_control')
 
 # Alert patterns
 PATTERNS = {
@@ -307,25 +284,28 @@ if __name__ == '__main__':
 
 ---
 
-## Port Assignment
+## 🔗 Port Assignment
 
-Ports are assigned based on **device serial number** for persistence:
+Ports are assigned based on **slot** — the physical USB port position on the Pi (or hub). This means a device always gets the same TCP port regardless of which `/dev/ttyUSBx` name the kernel assigns, as long as it is plugged into the same physical port.
 
-| Serial Number | Port |
-|---------------|------|
-| 94_A9_90_47_5B_48 | 4001 |
-| A5069RR4 | 4002 |
-| (new device) | 4003+ |
+Slot configuration is stored in `/etc/rfc2217/slots.json`:
 
-**Key feature:** When an ESP32 resets or reconnects, it keeps the same port even if the tty name changes (e.g., ttyACM0 -> ttyACM1). This ensures containers always connect to the same device.
+```json
+{
+  "slots": [
+    {"slot_key": "platform-3f980000.usb-usb-0:1.2:1.0", "label": "ESP32-A", "tcp_port": 4001},
+    {"slot_key": "platform-3f980000.usb-usb-0:1.3:1.0", "label": "ESP32-B", "tcp_port": 4002}
+  ]
+}
+```
 
-Config stored in: `/etc/rfc2217/devices.conf`
+Use `rfc2217-learn-slots` to discover the slot keys for your connected devices, then edit the file to assign labels and ports.
 
-Check the web portal for current assignments.
+**Key feature:** When an ESP32 resets or reconnects, it keeps the same port as long as it stays in the same physical USB slot. The portal supervisor automatically restarts proxies on hotplug events.
 
 ---
 
-## Serial Logging
+## 📋 Serial Logging
 
 All serial traffic is automatically logged with timestamps to `/var/log/serial/` on the Pi.
 
@@ -342,34 +322,33 @@ CP2102_USB_to_UART_0001_2026-02-03.log
 [2026-02-03 19:32:00.711] [TX] Data sent to ESP32...
 ```
 
-**View logs via API:**
-```bash
-# List all logs
-curl http://PI_IP:8080/api/logs
-
-# Get last 100 lines of a log
-curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=100"
-```
-
 **View logs on Pi:**
 ```bash
 tail -f /var/log/serial/*.log
 ```
 
-This allows AI monitoring, debugging, and post-mortem analysis of ESP32 behavior.
+**View portal service logs:**
+```bash
+journalctl -u rfc2217-portal -f
+```
+
+This allows debugging and post-mortem analysis of device behavior.
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 ### Connection Refused
 
 ```bash
-# Check if server is running on Pi
+# Check if proxy is running on Pi
 ss -tlnp | grep 400
 
-# Start via portal or manually
-esp_rfc2217_server.py -p 4001 /dev/ttyUSB0
+# Check portal logs for errors
+journalctl -u rfc2217-portal --no-pager -n 50
+
+# Or start a proxy manually for testing
+python3 /usr/local/bin/serial_proxy.py -p 4001 /dev/ttyUSB0
 ```
 
 ### Device Not Detected
@@ -395,33 +374,55 @@ Only one client can connect at a time. Close other connections first.
 
 ---
 
-## Files
+## 📂 Files
 
 ```
-.
-├── pi/
-│   ├── portal.py              # Web portal (auto-starts servers)
-│   ├── serial_proxy.py        # RFC2217 proxy with logging
-│   ├── scripts/
-│   │   └── rfc2217-hotplug.sh # Hotplug handler for udev
-│   ├── udev/
-│   │   └── 99-rfc2217.rules   # Auto-start on device plug
-│   └── systemd/
-│       └── rfc2217-portal.service
-├── container/
-│   ├── README.md              # Container setup guide
-│   ├── devcontainer.json      # VS Code devcontainer
-│   └── scripts/
-│       ├── discover.py        # Device discovery helper
-│       └── monitor.py         # Example serial monitor
-├── docs/
-│   └── Setup Guide.md         # Detailed setup documentation
-└── README.md                  # This file
+pi/
+├── portal.py                     # Web portal + proxy supervisor (v3)
+├── serial_proxy.py               # RFC2217 proxy with serial logging
+├── install.sh                    # Installer script
+├── rfc2217-learn-slots           # Slot discovery tool
+├── config/
+│   └── slots.json                # Slot configuration (template)
+├── scripts/
+│   └── rfc2217-udev-notify.sh   # udev event forwarder
+├── udev/
+│   └── 99-rfc2217-hotplug.rules # udev rules for hotplug events
+└── systemd/
+    └── rfc2217-portal.service   # systemd unit for the portal
 ```
 
 ---
 
-## Network Requirements
+## 📡 API Endpoints
+
+The portal exposes a JSON API on port 8080:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/devices` | List all slots with current status |
+| GET | `/api/info` | System info (host IP, slot counts) |
+| POST | `/api/hotplug` | Receive udev hotplug events (used by `rfc2217-udev-notify.sh`) |
+| POST | `/api/start` | Manually start a proxy for a slot (`slot_key`, `devnode` required) |
+| POST | `/api/stop` | Manually stop a proxy for a slot (`slot_key` required) |
+
+**Example:**
+```bash
+# List all slots
+curl http://PI_IP:8080/api/devices
+
+# System info
+curl http://PI_IP:8080/api/info
+
+# Manually stop a slot
+curl -X POST http://PI_IP:8080/api/stop \
+  -H "Content-Type: application/json" \
+  -d '{"slot_key": "platform-3f980000.usb-usb-0:1.2:1.0"}'
+```
+
+---
+
+## 🌐 Network Requirements
 
 | Port | Direction | Purpose |
 |------|-----------|---------|
@@ -430,6 +431,6 @@ Only one client can connect at a time. Close other connections first.
 
 ---
 
-## License
+## 📄 License
 
 MIT License - feel free to use and modify!

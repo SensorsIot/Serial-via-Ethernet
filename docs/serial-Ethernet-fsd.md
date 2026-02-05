@@ -44,12 +44,12 @@ Expose USB serial devices (ESP32, Arduino) from a Raspberry Pi to network client
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| rfc2217-portal | /usr/local/bin/rfc2217-portal | Web UI, API, process supervisor |
-| serial_proxy.py | /usr/local/bin/serial_proxy.py | RFC2217 server with logging |
-| rfc2217-hotplug | /usr/local/bin/rfc2217-hotplug | Event handler (udev → portal) |
+| rfc2217-portal (portal.py) | /usr/local/bin/rfc2217-portal | Web UI, API, process supervisor, hotplug handler |
+| esp_rfc2217_server.py | /usr/local/bin/esp_rfc2217_server.py | RFC2217 server from esptool (preferred, stable) |
+| serial_proxy.py | /usr/local/bin/serial_proxy.py | RFC2217 server with logging (fallback) |
+| rfc2217-udev-notify.sh | /usr/local/bin/rfc2217-udev-notify.sh | Shell script: posts udev events to portal API |
 | rfc2217-learn-slots | /usr/local/bin/rfc2217-learn-slots | Slot configuration helper |
-| 99-rfc2217.rules | /etc/udev/rules.d/ | udev rules for hotplug |
-| rfc2217-hotplug@.service | /etc/systemd/system/ | systemd template for hotplug |
+| 99-rfc2217-hotplug.rules | /etc/udev/rules.d/ | udev rules for hotplug |
 | slots.json | /etc/rfc2217/slots.json | Slot-to-port mapping |
 
 ---
@@ -63,8 +63,8 @@ Expose USB serial devices (ESP32, Arduino) from a Raspberry Pi to network client
 | **Slot** | Represents one physical connector position on the USB hub |
 | **slot_key** | Stable identifier for physical port topology (derived from udev `ID_PATH`) |
 | **devnode** | Current tty device path (e.g., `/dev/ttyACM0`) - may change on reconnect |
-| **serial_proxy** | Process implementing RFC2217 server for a local serial device |
-| **gen** (generation) | Monotonically increasing integer per slot event stream |
+| **proxy** | RFC2217 server process for a local serial device (`esp_rfc2217_server.py` preferred, `serial_proxy.py` fallback) |
+| **seq** (sequence) | Global monotonically increasing counter, incremented on every hotplug event |
 
 ### 2.2 Key Principle: Slot-Based Identity
 
@@ -89,21 +89,21 @@ This ensures:
 
 **Unplug Flow:**
 1. udev emits `remove` event for the serial device
-2. Hotplug handler determines `slot_key` from event
-3. Hotplug handler increments generation counter
-4. Hotplug handler calls Portal API `POST /api/stop` with `{slot_key, gen}`
-5. Portal stops the `serial_proxy` process for that slot (idempotent)
-6. Slot state becomes `running=false`, `devnode=null`
+2. udev rule invokes `rfc2217-udev-notify.sh` via `systemd-run --no-block`
+3. Notify script sends `POST /api/hotplug` with `{action: "remove", devnode, id_path, devpath}`
+4. Portal determines `slot_key` from `id_path` (or `devpath` fallback)
+5. Portal increments global `seq_counter`, records event metadata on the slot
+6. Portal stops the `serial_proxy` process for that slot (idempotent)
+7. Slot state becomes `running=false`, `present=false`
 
 **Plug Flow:**
 1. udev emits `add` event for the serial device
-2. Hotplug handler determines `slot_key` and `devnode` from event
-3. Hotplug handler increments generation counter
-4. Hotplug handler waits for device to settle (readiness checks, not fixed sleep)
-5. Hotplug handler calls Portal API `POST /api/start` with `{slot_key, devnode, gen}`
-6. Portal looks up assigned TCP port for that slot
-7. Portal starts `serial_proxy` bound to `devnode` on assigned TCP port
-8. Slot state becomes `running=true`
+2. udev rule invokes `rfc2217-udev-notify.sh` via `systemd-run --no-block`
+3. Notify script sends `POST /api/hotplug` with `{action: "add", devnode, id_path, devpath}`
+4. Portal determines `slot_key` from `id_path` (or `devpath` fallback)
+5. Portal increments global `seq_counter`, records event metadata on the slot
+6. Portal spawns a background thread that acquires the slot lock, waits for the device to settle, then starts `serial_proxy` bound to `devnode` on the configured TCP port
+7. Slot state becomes `running=true`, `present=true`
 
 ### 3.2 Slot Configuration (FR-002)
 
@@ -130,24 +130,33 @@ This ensures:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | /api/devices | GET | List all slots with status |
-| /api/start | POST | Start server for slot |
-| /api/stop | POST | Stop server for slot |
+| /api/hotplug | POST | Receive udev hotplug event (add/remove) |
+| /api/start | POST | Manually start proxy for slot |
+| /api/stop | POST | Manually stop proxy for slot |
 | /api/info | GET | Get Pi IP and system info |
+
+**Request Format (POST /api/hotplug):**
+```json
+{
+  "action": "add",
+  "devnode": "/dev/ttyACM0",
+  "id_path": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0",
+  "devpath": "/devices/platform/scb/fd500000.pcie/.../ttyACM0"
+}
+```
 
 **Request Format (POST /api/start):**
 ```json
 {
   "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0",
-  "devnode": "/dev/ttyACM0",
-  "gen": 42
+  "devnode": "/dev/ttyACM0"
 }
 ```
 
 **Request Format (POST /api/stop):**
 ```json
 {
-  "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0",
-  "gen": 43
+  "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0"
 }
 ```
 
@@ -159,23 +168,32 @@ This ensures:
       "label": "SLOT1",
       "slot_key": "platform-...-usb-0:1.1:1.0",
       "tcp_port": 4001,
+      "present": true,
       "running": true,
       "devnode": "/dev/ttyACM0",
       "pid": 1234,
       "url": "rfc2217://192.168.0.87:4001",
-      "last_gen": 42
+      "seq": 5,
+      "last_action": "add",
+      "last_event_ts": "2026-02-05T12:34:56+00:00",
+      "last_error": null
     },
     {
       "label": "SLOT2",
       "slot_key": "platform-...-usb-0:1.2:1.0",
       "tcp_port": 4002,
+      "present": false,
       "running": false,
       "devnode": null,
       "pid": null,
       "url": "rfc2217://192.168.0.87:4002",
-      "last_gen": 0
+      "seq": 0,
+      "last_action": null,
+      "last_event_ts": null,
+      "last_error": null
     }
-  ]
+  ],
+  "host_ip": "192.168.0.87"
 }
 ```
 
@@ -216,30 +234,25 @@ def get_slot_key(udev_env):
     raise ValueError("Cannot determine slot_key: no ID_PATH or DEVPATH")
 ```
 
-### 4.2 Generation Tracking
+### 4.2 Sequence Counter
 
-Each slot maintains a generation counter to handle race conditions:
+The portal owns a single global monotonic `seq_counter` in memory (no files on disk).
+Every hotplug event increments the counter and stamps the affected slot:
 
 ```python
-# Storage: /run/rfc2217/gen/<slot_key_hash>.txt
+# Module-level state (in portal.py)
+seq_counter: int = 0
 
-def get_next_gen(slot_key):
-    """Increment and return generation number for slot."""
-    path = f"/run/rfc2217/gen/{hash(slot_key)}.txt"
-    gen = int(read_file(path) or 0)
-    gen += 1
-    write_file(path, str(gen))
-    return gen
+# Inside _handle_hotplug:
+seq_counter += 1
+slot["seq"] = seq_counter
+slot["last_action"] = action       # "add" or "remove"
+slot["last_event_ts"] = datetime.now(timezone.utc).isoformat()
 ```
 
-**Portal applies request only if:**
-```python
-if request.gen >= slot.last_gen:
-    slot.last_gen = request.gen
-    # Process request
-else:
-    # Ignore stale request (return OK with ignored=true)
-```
+The sequence number provides a total ordering of events for diagnostics.
+Because the portal processes hotplug requests serially per slot (via per-slot locks),
+stale-event races are prevented by locking rather than by comparing counters.
 
 ### 4.3 API Idempotency
 
@@ -256,28 +269,32 @@ else:
 
 ### 4.4 Per-Slot Locking
 
-Portal serializes operations per slot:
+Portal serializes operations per slot using in-memory `threading.Lock` objects:
 
 ```python
-# Lock file: /run/rfc2217/locks/<slot_key_hash>.lock
+# Each slot dict holds its own lock (created at config load time)
+slot["_lock"] = threading.Lock()
 
-with flock(f"/run/rfc2217/locks/{hash(slot_key)}.lock"):
-    # Only one start/stop operation per slot at a time
-    process_request(slot_key, request)
+# Usage (e.g., inside hotplug add handler):
+with slot["_lock"]:
+    stop_proxy(slot)   # stop old proxy if running
+    start_proxy(slot)  # start new proxy
 ```
+
+No file-based locks or `/run/rfc2217/locks/` directory is used.
 
 ### 4.5 Device Settle Checks
 
-Instead of fixed sleep, hotplug handler checks readiness:
+The portal's `start_proxy` function performs settle checks inline (no separate
+handler). It polls the device node before launching `serial_proxy`:
 
 ```python
 def wait_for_device(devnode, timeout=5.0):
-    """Wait for device to be usable."""
+    """Wait for device to be usable (called inside portal)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(devnode):
             try:
-                # Try to open device
                 fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
                 os.close(fd)
                 return True
@@ -287,33 +304,55 @@ def wait_for_device(devnode, timeout=5.0):
     return False
 ```
 
+If the device does not settle within the timeout, the slot's `last_error` is set
+and the proxy is not started.
+
 ### 4.6 udev Rules
 
 ```
-# /etc/udev/rules.d/99-rfc2217.rules
-# Trigger systemd service for serial device hotplug
+# /etc/udev/rules.d/99-rfc2217-hotplug.rules
+# Notify portal of USB serial add/remove events.
+# systemd-run escapes udev's PrivateNetwork sandbox so curl can reach localhost.
 
-ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyACM*", TAG+="systemd", ENV{SYSTEMD_WANTS}="rfc2217-hotplug@add-%k.service"
-ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/local/bin/rfc2217-hotplug remove %E{DEVNAME} %E{ID_PATH}"
-
-ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", TAG+="systemd", ENV{SYSTEMD_WANTS}="rfc2217-hotplug@add-%k.service"
-ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/local/bin/rfc2217-hotplug remove %E{DEVNAME} %E{ID_PATH}"
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
 ```
 
-### 4.7 systemd Service Template
+The notify script is a thin shell wrapper that posts a JSON payload to the portal:
+
+```bash
+#!/bin/bash
+# /usr/local/bin/rfc2217-udev-notify.sh
+# Args: ACTION DEVNAME ID_PATH DEVPATH
+
+curl -m 2 -s -X POST http://127.0.0.1:8080/api/hotplug \
+  -H 'Content-Type: application/json' \
+  -d "{\"action\":\"$1\",\"devnode\":\"$2\",\"id_path\":\"${3:-}\",\"devpath\":\"$4\"}" \
+  || true
+```
+
+### 4.7 systemd Service (Portal)
+
+The portal runs as a long-lived systemd service. There is no separate
+`rfc2217-hotplug@.service` template; udev events are delivered to the portal
+via `systemd-run` and the notify script (see 4.6).
 
 ```ini
-# /etc/systemd/system/rfc2217-hotplug@.service
+# /etc/systemd/system/rfc2217-portal.service
 [Unit]
-Description=RFC2217 Hotplug Handler for %i
-After=network.target rfc2217-portal.service
+Description=RFC2217 Portal
+After=network.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/rfc2217-hotplug add /dev/%i
-Environment=DEVNAME=/dev/%i
+ExecStart=/usr/bin/python3 /usr/local/bin/rfc2217-portal
+Restart=on-failure
 StandardOutput=journal
 StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ### 4.8 Network Ports
@@ -334,8 +373,8 @@ StandardError=journal
 | Scenario | How Handled |
 |----------|-------------|
 | `/dev/ttyACM0` → `/dev/ttyACM1` renaming | slot_key unchanged (based on physical port) |
-| Duplicate udev events | API idempotency, generation check |
-| "Remove after add" races (USB reset) | Generation monotonicity prevents late stop |
+| Duplicate udev events | API idempotency, per-slot locking |
+| "Remove after add" races (USB reset) | Per-slot locking serializes operations; sequence counter aids diagnostics |
 | Two identical boards | Different slot_keys (different physical connectors) |
 | Hub/Pi reboot | Static config preserves port assignments |
 
@@ -349,7 +388,7 @@ StandardError=journal
 
 - Portal API must be idempotent
 - Actions serialized per slot (locking)
-- Stale events ignored via generation check
+- Stale events prevented via per-slot locking; sequence counter for observability
 
 ---
 
@@ -387,9 +426,9 @@ Add this to /etc/rfc2217/slots.json:
 | Case | Behavior |
 |------|----------|
 | Two identical boards | Works - different slot_keys (different physical connectors) |
-| Device re-enumeration (USB reset) | Generation check prevents late stop from killing new start |
+| Device re-enumeration (USB reset) | Per-slot locking serializes add/remove; background thread restart is safe |
 | Duplicate events | Idempotency prevents flapping |
-| Unknown slot_key | Portal returns 404, logs for diagnostics |
+| Unknown slot_key | Portal tracks the slot (present, seq) but does not start a proxy; logged for diagnostics |
 | Hub topology changed | Must re-learn and update config |
 | Device not ready | Settle checks with timeout, then fail |
 
@@ -422,7 +461,7 @@ Add this to /etc/rfc2217/slots.json:
 ### TC-005: USB Reset Race
 1. Have device running in SLOT1
 2. Force USB reset (quick unplug/replug)
-3. **Pass:** No "stuck stopped" state; generation logic handles race
+3. **Pass:** No "stuck stopped" state; per-slot locking serializes the events
 
 ### TC-006: Devnode Renaming
 1. Plug device into SLOT1 as `/dev/ttyACM0`
@@ -444,14 +483,14 @@ Add this to /etc/rfc2217/slots.json:
 
 ## 9. Implementation Tasks
 
-- [ ] **TASK-001:** Create slot-based configuration loader
-- [ ] **TASK-002:** Implement generation tracking in hotplug handler
-- [ ] **TASK-003:** Implement per-slot locking in portal
-- [ ] **TASK-004:** Update portal API for slot_key/gen parameters
-- [ ] **TASK-005:** Implement device settle checks (replace fixed sleep)
-- [ ] **TASK-006:** Create systemd service template for hotplug
-- [ ] **TASK-007:** Update udev rules for systemd integration
-- [ ] **TASK-008:** Create rfc2217-learn-slots tool
+- [x] **TASK-001:** Create slot-based configuration loader
+- [x] **TASK-002:** Implement sequence counter in portal
+- [x] **TASK-003:** Implement per-slot locking in portal (threading.Lock)
+- [x] **TASK-004:** Implement POST /api/hotplug endpoint in portal
+- [x] **TASK-005:** Implement device settle checks in portal start_proxy
+- [x] **TASK-006:** Create rfc2217-udev-notify.sh script
+- [x] **TASK-007:** Create 99-rfc2217-hotplug.rules (systemd-run based)
+- [x] **TASK-008:** Create rfc2217-learn-slots tool
 - [ ] **TASK-009:** Update web UI to show slot-based view
 - [ ] **TASK-010:** Test all test cases
 - [ ] **TASK-011:** Deploy to Serial Pi (192.168.0.87)
@@ -462,13 +501,14 @@ Add this to /etc/rfc2217/slots.json:
 
 | Deliverable | Description |
 |-------------|-------------|
-| `rfc2217-portal` | HTTP server with slot management, process supervision |
-| `rfc2217-hotplug` | Event handler: derives slot_key, manages gen, calls API |
+| `portal.py` (`rfc2217-portal`) | HTTP server with slot management, process supervision, hotplug handling |
+| `esp_rfc2217_server.py` | RFC2217 server from esptool (preferred — stable, supports flashing and monitoring) |
+| `serial_proxy.py` | RFC2217 proxy with serial traffic logging (fallback) |
+| `rfc2217-udev-notify.sh` | Shell script: posts udev events to portal API via curl |
 | `rfc2217-learn-slots` | CLI tool to discover slot_key for physical connectors |
-| `99-rfc2217.rules` | udev rules for systemd integration |
-| `rfc2217-hotplug@.service` | systemd template unit |
+| `99-rfc2217-hotplug.rules` | udev rules using systemd-run to invoke notify script |
+| `rfc2217-portal.service` | systemd unit for the portal |
 | `slots.json` | Slot configuration file |
-| Installation docs | Setup and slot learning instructions |
 
 ---
 
@@ -480,3 +520,4 @@ Add this to /etc/rfc2217/slots.json:
 | 1.1 | 2026-02-05 | Claude | Implemented serial-based port assignment |
 | 1.2 | 2026-02-05 | Claude | Testing complete for serial-based approach |
 | 2.0 | 2026-02-05 | Claude | Major rewrite: event-driven slot-based architecture |
+| 3.0 | 2026-02-05 | Claude | Portal v3: portal handles hotplug directly via POST /api/hotplug; removed separate hotplug handler binary and systemd template; in-memory seq counter and threading.Lock per slot; udev rules use systemd-run with rfc2217-udev-notify.sh |
