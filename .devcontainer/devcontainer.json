@@ -1,0 +1,57 @@
+{
+    "name": "USB-Serial-via-Ethernet - Python Development",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "workspaceFolder": "/workspaces/USB-Serial-via-Ethernet",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "charliermarsh.ruff",
+                "ms-python.debugpy"
+            ],
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "python.defaultInterpreterPath": "/usr/bin/python3",
+                "python.analysis.typeCheckingMode": "basic",
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff",
+                    "editor.formatOnSave": true
+                }
+            }
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.11"
+        },
+        "ghcr.io/devcontainers/features/git:1": {},
+        "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "lts"
+        },
+        "ghcr.io/devcontainers/features/sshd:1": {
+            "version": "latest"
+        }
+    },
+    "appPort": ["2222:2222"],
+    "postCreateCommand": "git config --global credential.helper store && git config --global core.sshCommand 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' && (git clone https://github.com/SensorsIot/claude.git ~/.claude 2>/dev/null || (cd ~/.claude && git pull)) && mkdir -p ~/.claude-data/projects && ln -sf ~/.claude-data/.credentials.json ~/.claude/.credentials.json && ln -sf ~/.claude-data/history.jsonl ~/.claude/history.jsonl && rm -rf ~/.claude/projects && ln -sf ~/.claude-data/projects ~/.claude/projects && ln -sf ~/.claude-data/.claude.json ~/.claude.json && npm install -g @anthropic-ai/claude-code && echo 'alias superclaude=\"claude --dangerously-skip-permissions\"' >> ~/.bashrc && pip install -r requirements-dev.txt 2>/dev/null || pip install pyserial",
+    "remoteUser": "dev",
+    "mounts": [
+        "source=${localEnv:HOME}/.ssh/authorized_keys,target=/home/dev/.ssh/authorized_keys,type=bind,readonly",
+        "source=${localEnv:HOME}/.ssh/id_ed25519,target=/home/dev/.ssh/id_ed25519,type=bind,readonly",
+        "source=${localEnv:HOME}/.git-credentials,target=/home/dev/.git-credentials,type=bind,readonly",
+        "source=${localWorkspaceFolder}/.claude-data,target=/home/dev/.claude-data,type=bind"
+    ],
+    "containerEnv": {
+        "SERIAL_PI": "192.168.0.87",
+        "INFLUXDB_TOKEN": "${localEnv:INFLUXDB_TOKEN}",
+        "INFLUXDB_URL": "${localEnv:INFLUXDB_URL}",
+        "INFLUXDB_ORG": "${localEnv:INFLUXDB_ORG}",
+        "HA_TOKEN": "${localEnv:HA_TOKEN}",
+        "HA_URL": "${localEnv:HA_URL}"
+    }
+}

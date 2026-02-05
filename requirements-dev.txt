@@ -1,0 +1,8 @@
+# Runtime dependencies
+pyserial>=3.5
+
+# Development tools
+pytest>=7.4.0
+pytest-cov>=4.1.0
+ruff>=0.1.0
+mypy>=1.5.0
