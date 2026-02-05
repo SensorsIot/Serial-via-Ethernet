@@ -341,13 +341,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Start serial proxy with logging for device"""
         # Get device info for serial-based port assignment
         device_info = self.get_device_info(tty)
+        serial = self.normalize_serial(device_info.get('serial', ''))
         config = self.read_config()
         port = self.assign_port(device_info, config)
 
-        # Check if already running
+        # Check if already running on this tty
         running = self.get_running_servers()
         if tty in running:
             return True, f"Already running on port {running[tty]['port']}"
+
+        # Stop any server running on the same port (prevents conflicts)
+        for other_tty, info in running.items():
+            if info['port'] == port and other_tty != tty:
+                try:
+                    os.kill(info['pid'], signal.SIGTERM)
+                    time.sleep(0.5)
+                except: pass
 
         # Find serial_proxy or fall back to esp_rfc2217_server
         server_paths = [

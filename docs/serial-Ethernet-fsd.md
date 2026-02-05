@@ -246,7 +246,7 @@ ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/local/bin/rfc2
 - [x] **TASK-003:** Update read_config/write_config for new format
 - [x] **TASK-004:** Add migration for existing tty-based config
 - [x] **TASK-005:** Fix udev rule to call correct hotplug script name
-- [ ] **TASK-006:** Test all test cases
+- [x] **TASK-006:** Test all test cases
 - [x] **TASK-007:** Update documentation
 - [x] **TASK-008:** Deploy to Serial Pi (192.168.0.87)
 
@@ -258,3 +258,4 @@ ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/local/bin/rfc2
 |---------|------|--------|---------|
 | 1.0 | 2026-02-05 | Claude | Initial FSD |
 | 1.1 | 2026-02-05 | Claude | Implemented FR-001 (persistent port assignment) |
+| 1.2 | 2026-02-05 | Claude | All implementation tasks complete, testing passed |
