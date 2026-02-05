@@ -1,763 +1,482 @@
 #!/usr/bin/env python3
-"""RFC2217 Serial Portal - Web interface for managing serial-over-TCP servers"""
+"""
+RFC2217 Portal v3 — Proxy Supervisor
+
+HTTP server that tracks USB serial device hotplug events and manages
+serial_proxy.py lifecycle.  On hotplug add → start proxy; on remove → stop it.
+Slot configuration is loaded from slots.json.
+"""
 
 import http.server
 import json
-import subprocess
 import os
-import re
-import socketserver
 import signal
+import socket
+import subprocess
+import sys
+import threading
 import time
-import glob
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 PORT = 8080
-CONFIG_FILE = "/etc/rfc2217/devices.conf"
+CONFIG_FILE = os.environ.get("RFC2217_CONFIG", "/etc/rfc2217/slots.json")
+PROXY_PATHS = ["/usr/local/bin/serial_proxy.py", "/usr/local/bin/serial-proxy"]
 LOG_DIR = "/var/log/serial"
-RFC2217_BASE_PORT = 4001  # Start from 4001, one port per device
 
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-    <title>RFC2217 Serial Portal</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-        h1 { color: #333; border-bottom: 2px solid #17a2b8; padding-bottom: 10px; }
-        .card { background: white; border-radius: 8px; padding: 20px; margin: 15px 0;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .device { padding: 15px; background: #f8f9fa; margin: 10px 0; border-radius: 4px;
-                  border-left: 4px solid #17a2b8; }
-        .device.stopped { border-left-color: #dc3545; opacity: 0.7; }
-        .device-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .device-name { font-weight: bold; color: #333; }
-        .device-serial { font-size: 12px; color: #666; }
-        .device-url { font-family: monospace; background: #e9ecef; padding: 8px 12px;
-                      border-radius: 4px; margin-top: 10px; font-size: 14px; word-break: break-all; }
-        .device-url.stopped { color: #999; }
-        .copy-btn { font-size: 11px; padding: 4px 8px; cursor: pointer; background: #6c757d;
-                    color: white; border: none; border-radius: 3px; margin-left: 10px; }
-        .copy-btn:hover { background: #5a6268; }
-        button { background: #17a2b8; color: white; border: none; padding: 10px 20px;
-                border-radius: 4px; cursor: pointer; font-size: 14px; margin: 5px 5px 5px 0; }
-        button:hover { background: #138496; }
-        button.danger { background: #dc3545; }
-        button.danger:hover { background: #c82333; }
-        button.success { background: #28a745; }
-        button.success:hover { background: #218838; }
-        .status-badge { font-size: 11px; padding: 3px 8px; border-radius: 3px; font-weight: bold; }
-        .status-badge.running { background: #28a745; color: white; }
-        .status-badge.stopped { background: #dc3545; color: white; }
-        .info-box { background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px;
-                    padding: 15px; margin: 15px 0; color: #0c5460; }
-        .info-box code { background: #fff; padding: 2px 6px; border-radius: 3px; }
-        .refresh-btn { font-size: 12px; padding: 5px 10px; }
-        .actions { margin-top: 10px; }
-        pre { background: #1e1e1e; color: #0f0; padding: 15px; border-radius: 4px;
-              font-size: 13px; overflow-x: auto; }
-    </style>
-</head>
-<body>
-    <h1>RFC2217 Serial Portal</h1>
+# Module-level state
+slots: dict[str, dict] = {}
+seq_counter: int = 0
+host_ip: str = "127.0.0.1"
 
-    <div class="card">
-        <h3>Network Info</h3>
-        <div class="info-box">
-            <strong>Pi Address:</strong> <code id="pi-addr">Loading...</code><br>
-            <small>Use this IP in your container's RFC2217 URL</small>
-        </div>
-    </div>
 
-    <div class="card">
-        <h3>Serial Devices <button class="refresh-btn" onclick="loadDevices()">Refresh</button></h3>
-        <div id="devices">Loading...</div>
-        <div style="margin-top: 15px;">
-            <button onclick="startAll()" class="success">Start All</button>
-            <button onclick="stopAll()" class="danger">Stop All</button>
-        </div>
-    </div>
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    <div class="card">
-        <h3>Usage Examples</h3>
-        <p><strong>Python (pyserial):</strong></p>
-        <pre>import serial
-ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)</pre>
-
-        <p><strong>esptool:</strong></p>
-        <pre>esptool --port rfc2217://PI_IP:4001?ign_set_control flash_id</pre>
-
-        <p><strong>PlatformIO (platformio.ini):</strong></p>
-        <pre>upload_port = rfc2217://PI_IP:4001?ign_set_control
-monitor_port = rfc2217://PI_IP:4001?ign_set_control</pre>
-
-        <p><strong>Create local /dev/tty (socat):</strong></p>
-        <pre>socat pty,link=/dev/ttyESP32,raw tcp:PI_IP:4001</pre>
-    </div>
-
-    <script>
-        let piAddr = '';
-
-        function log(msg) { console.log(msg); }
-
-        async function api(endpoint, method='GET', body=null) {
-            const opts = { method };
-            if (body) { opts.headers = {'Content-Type':'application/json'}; opts.body = JSON.stringify(body); }
-            const res = await fetch('/api/' + endpoint, opts);
-            return res.json();
-        }
-
-        async function loadInfo() {
-            const data = await api('info');
-            piAddr = data.ip || 'PI_IP';
-            document.getElementById('pi-addr').textContent = piAddr;
-        }
-
-        async function loadDevices() {
-            const data = await api('devices');
-            const el = document.getElementById('devices');
-            const devices = data.devices || [];
-
-            if (devices.length === 0) {
-                el.innerHTML = '<p style="color:#666">No serial devices detected. Connect an ESP32 or Arduino.</p>';
-                return;
+def load_config(path: str) -> dict[str, dict]:
+    """Parse slots.json and return pre-populated slots dict keyed by slot_key."""
+    result: dict[str, dict] = {}
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        for entry in cfg.get("slots", []):
+            key = entry["slot_key"]
+            result[key] = {
+                "label": entry["label"],
+                "slot_key": key,
+                "tcp_port": entry["tcp_port"],
+                "present": False,
+                "running": False,
+                "pid": None,
+                "devnode": None,
+                "seq": 0,
+                "last_action": None,
+                "last_event_ts": None,
+                "url": None,
+                "last_error": None,
+                "_lock": threading.Lock(),
             }
+        print(f"[portal] loaded {len(result)} slot(s) from {path}", flush=True)
+    except FileNotFoundError:
+        print(f"[portal] config not found: {path} (starting with no slots)", flush=True)
+    except Exception as exc:
+        print(f"[portal] error loading config: {exc}", flush=True)
+    return result
 
-            el.innerHTML = devices.map(d => {
-                const statusClass = d.running ? 'running' : 'stopped';
-                const deviceClass = d.running ? '' : 'stopped';
-                const url = 'rfc2217://' + piAddr + ':' + d.port;
-                return '<div class="device ' + deviceClass + '">' +
-                    '<div class="device-header">' +
-                    '<div>' +
-                    '<span class="device-name">' + (d.product || d.tty) + '</span>' +
-                    (d.serial ? ' <span class="device-serial">[' + d.serial + ']</span>' : '') +
-                    '</div>' +
-                    '<span class="status-badge ' + statusClass + '">' + (d.running ? 'Running' : 'Stopped') + '</span>' +
-                    '</div>' +
-                    '<div class="device-url ' + (d.running ? '' : 'stopped') + '">' +
-                    '<strong>Port ' + d.port + ':</strong> ' + url +
-                    '<button class="copy-btn" onclick="copyUrl(\\'' + url + '\\')">Copy</button>' +
-                    '</div>' +
-                    '<div class="actions">' +
-                    (d.running ?
-                        '<button class="danger" onclick="stopDevice(\\'' + d.tty + '\\')">Stop</button>' :
-                        '<button class="success" onclick="startDevice(\\'' + d.tty + '\\')">Start</button>') +
-                    '</div>' +
-                    '</div>';
-            }).join('');
-        }
 
-        function copyUrl(url) {
-            navigator.clipboard.writeText(url);
-        }
+def get_host_ip() -> str:
+    """Detect host IP via UDP socket trick."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
-        async function startDevice(tty) {
-            await api('start', 'POST', { tty });
-            loadDevices();
-        }
 
-        async function stopDevice(tty) {
-            await api('stop', 'POST', { tty });
-            loadDevices();
-        }
+def _find_proxy_exe() -> str | None:
+    for p in PROXY_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
 
-        async function startAll() {
-            await api('start-all', 'POST');
-            loadDevices();
-        }
 
-        async function stopAll() {
-            await api('stop-all', 'POST');
-            loadDevices();
-        }
+def wait_for_device(devnode: str, timeout: float = 5.0) -> bool:
+    """Poll os.open() until the device node is ready."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(devnode):
+            try:
+                fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
+                os.close(fd)
+                return True
+            except OSError:
+                pass
+        time.sleep(0.1)
+    return False
 
-        loadInfo();
-        loadDevices();
-        setInterval(loadDevices, 5000);
-    </script>
-</body>
-</html>
-"""
+
+def is_port_listening(port: int) -> bool:
+    """Quick TCP connect check on localhost."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(("127.0.0.1", port))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def _is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_proxy(slot: dict) -> bool:
+    """Start serial_proxy for *slot*.  Returns True on success."""
+    devnode = slot["devnode"]
+    tcp_port = slot["tcp_port"]
+    label = slot["label"]
+
+    proxy_exe = _find_proxy_exe()
+    if not proxy_exe:
+        slot["last_error"] = "No serial proxy executable found"
+        print(f"[portal] {label}: {slot['last_error']}", flush=True)
+        return False
+
+    # Settle — done *before* acquiring lock (caller holds lock already)
+    if not wait_for_device(devnode):
+        slot["last_error"] = f"Device {devnode} not ready after settle timeout"
+        print(f"[portal] {label}: {slot['last_error']}", flush=True)
+        return False
+
+    cmd = ["python3", proxy_exe, "-p", str(tcp_port)]
+    if "serial_proxy" in proxy_exe:
+        cmd.extend(["-l", LOG_DIR])
+    cmd.append(devnode)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        slot["last_error"] = str(exc)
+        print(f"[portal] {label}: popen failed: {exc}", flush=True)
+        return False
+
+    # Brief pause then check it didn't die immediately
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        slot["last_error"] = f"Proxy exited immediately (code {proc.returncode})"
+        print(f"[portal] {label}: {slot['last_error']}", flush=True)
+        return False
+
+    # Wait up to 2 s for port to be listening
+    for _ in range(20):
+        if is_port_listening(tcp_port):
+            slot["running"] = True
+            slot["pid"] = proc.pid
+            slot["last_error"] = None
+            slot["url"] = f"rfc2217://{host_ip}:{tcp_port}"
+            print(
+                f"[portal] {label}: proxy started (pid {proc.pid}, port {tcp_port})",
+                flush=True,
+            )
+            return True
+        time.sleep(0.1)
+
+    # Port never came up — kill the process
+    _stop_pid(proc.pid)
+    slot["last_error"] = "Proxy started but port not listening"
+    print(f"[portal] {label}: {slot['last_error']}", flush=True)
+    return False
+
+
+def _stop_pid(pid: int, timeout: float = 5.0):
+    """SIGTERM, wait, SIGKILL fallback."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _is_process_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def stop_proxy(slot: dict) -> bool:
+    """Stop proxy for *slot*.  Returns True if stopped (or already stopped)."""
+    label = slot["label"]
+    pid = slot["pid"]
+    if pid and _is_process_alive(pid):
+        print(f"[portal] {label}: stopping proxy (pid {pid})", flush=True)
+        _stop_pid(pid)
+    slot["running"] = False
+    slot["pid"] = None
+    slot["url"] = None
+    slot["last_error"] = None
+    return True
+
+
+def _make_dynamic_slot(slot_key: str) -> dict:
+    """Create a minimal slot dict for an unknown (unconfigured) slot_key."""
+    return {
+        "label": None,
+        "slot_key": slot_key,
+        "tcp_port": None,
+        "present": False,
+        "running": False,
+        "pid": None,
+        "devnode": None,
+        "seq": 0,
+        "last_action": None,
+        "last_event_ts": None,
+        "url": None,
+        "last_error": None,
+        "_lock": threading.Lock(),
+    }
+
+
+def _refresh_slot_health(slot: dict):
+    """Check that a slot's proxy is still alive; mark dead if not."""
+    if slot["running"] and slot["pid"]:
+        if not _is_process_alive(slot["pid"]):
+            slot["running"] = False
+            slot["pid"] = None
+            slot["url"] = None
+            slot["last_error"] = "Process died"
+
+
+def _slot_info(slot: dict) -> dict:
+    """Return a JSON-safe copy of a slot (excludes _lock)."""
+    return {k: v for k, v in slot.items() if not k.startswith("_")}
+
+
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
 
-    def send_json(self, data, status=200):
+    def log_message(self, fmt, *args):
+        print(f"[portal] {self.address_string()} {fmt % args}", flush=True)
+
+    # -- helpers --
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode()
         self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", len(body))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(body)
 
-    def send_html(self, html):
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return None
+        return json.loads(self.rfile.read(length))
+
+    # -- routes --
+
+    def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
-        self.wfile.write(html.encode())
-
-    def get_ip(self):
-        """Get Pi's IP address"""
-        try:
-            result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=5)
-            ips = result.stdout.strip().split()
-            return ips[0] if ips else '127.0.0.1'
-        except:
-            return '127.0.0.1'
-
-    def read_config(self):
-        """Read device-port assignments: {key: port} where key is serial or tty"""
-        config = {}
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE) as f:
-                    for line in f:
-                        if '=' in line and not line.strip().startswith('#'):
-                            key, port = line.strip().split('=', 1)
-                            config[key] = int(port)
-            except: pass
-        return config
-
-    def write_config(self, config):
-        """Write device-port assignments (keyed by serial number or tty)"""
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        with open(CONFIG_FILE, 'w') as f:
-            f.write("# RFC2217 device-port assignments (by serial number or tty)\n")
-            for key, port in sorted(config.items(), key=lambda x: x[1]):
-                f.write(f"{key}={port}\n")
-
-    def normalize_serial(self, serial):
-        """Normalize serial number for use as config key (replace colons with underscores)"""
-        if not serial:
-            return ''
-        return serial.replace(':', '_').replace(' ', '_')
-
-    def get_serial_devices(self):
-        """Find all serial devices"""
-        devices = []
-
-        # Check /dev/ttyUSB* and /dev/ttyACM*
-        for pattern in ['/dev/ttyUSB*', '/dev/ttyACM*']:
-            for tty in glob.glob(pattern):
-                info = self.get_device_info(tty)
-                if info:
-                    devices.append(info)
-
-        return devices
-
-    def get_device_info(self, tty):
-        """Get device info from sysfs"""
-        info = {'tty': tty, 'product': '', 'serial': '', 'vendor': ''}
-
-        # Find sysfs path
-        tty_name = os.path.basename(tty)
-        sysfs_path = f"/sys/class/tty/{tty_name}/device"
-
-        if not os.path.exists(sysfs_path):
-            return info
-
-        # Walk up to find USB device attributes
-        try:
-            device_path = os.path.realpath(sysfs_path)
-            # Go up a few levels to find USB device
-            for _ in range(5):
-                device_path = os.path.dirname(device_path)
-                product_file = os.path.join(device_path, 'product')
-                if os.path.exists(product_file):
-                    break
-
-            for attr in ['product', 'serial', 'manufacturer']:
-                attr_file = os.path.join(device_path, attr)
-                if os.path.exists(attr_file):
-                    try:
-                        with open(attr_file) as f:
-                            info[attr] = f.read().strip()
-                    except: pass
-        except: pass
-
-        return info
-
-    def get_running_servers(self):
-        """Get running serial proxy or esp_rfc2217_server processes: {tty: {port, pid}}"""
-        servers = {}
-        # Check for both serial_proxy and esp_rfc2217_server
-        for pattern in ['serial.proxy', 'serial_proxy', 'esp_rfc2217_server']:
-            try:
-                result = subprocess.run(['pgrep', '-a', '-f', pattern],
-                    capture_output=True, text=True)
-                for line in result.stdout.strip().split('\n'):
-                    if not line:
-                        continue
-                    parts = line.split()
-                    pid = int(parts[0])
-                    # Parse args: -p PORT ... TTY
-                    port = None
-                    tty = None
-                    for i, arg in enumerate(parts):
-                        if arg == '-p' and i+1 < len(parts):
-                            try:
-                                port = int(parts[i+1])
-                            except: pass
-                        if arg.startswith('/dev/tty'):
-                            tty = arg
-                    if tty and port:
-                        servers[tty] = {'port': port, 'pid': pid}
-            except: pass
-        return servers
-
-    def assign_port(self, device_info, config):
-        """Assign a port to a device based on serial number (persistent) or tty (fallback)"""
-        tty = device_info['tty'] if isinstance(device_info, dict) else device_info
-        serial = self.normalize_serial(device_info.get('serial', '')) if isinstance(device_info, dict) else ''
-
-        # 1. Try serial number first (persistent across reconnects)
-        if serial and serial in config:
-            return config[serial]
-
-        # 2. Fallback to tty (legacy config entries)
-        if tty in config:
-            # Migrate: if we have serial, re-save with serial as key
-            if serial:
-                port = config[tty]
-                del config[tty]
-                config[serial] = port
-                self.write_config(config)
-            return config.get(serial, config.get(tty))
-
-        # 3. Assign next available port
-        used_ports = set(config.values())
-        port = RFC2217_BASE_PORT
-        while port in used_ports:
-            port += 1
-
-        # 4. Save with serial as key (preferred) or tty as fallback
-        key = serial if serial else tty
-        config[key] = port
-        self.write_config(config)
-        return port
-
-    def start_server(self, tty):
-        """Start serial proxy with logging for device"""
-        # Get device info for serial-based port assignment
-        device_info = self.get_device_info(tty)
-        serial = self.normalize_serial(device_info.get('serial', ''))
-        config = self.read_config()
-        port = self.assign_port(device_info, config)
-
-        # Check if already running on this tty
-        running = self.get_running_servers()
-        if tty in running:
-            return True, f"Already running on port {running[tty]['port']}"
-
-        # Stop any server running on the same port (prevents conflicts)
-        for other_tty, info in running.items():
-            if info['port'] == port and other_tty != tty:
-                try:
-                    os.kill(info['pid'], signal.SIGTERM)
-                    time.sleep(0.5)
-                except: pass
-
-        # Find serial_proxy or fall back to esp_rfc2217_server
-        server_paths = [
-            '/usr/local/bin/serial-proxy',
-            '/usr/local/bin/serial_proxy.py',
-            '/usr/local/bin/esp_rfc2217_server',
-            '/usr/local/bin/esp_rfc2217_server.py',
-            os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
-        ]
-
-        server_cmd = None
-        use_proxy = False
-        for path in server_paths:
-            if os.path.exists(path):
-                server_cmd = path
-                use_proxy = 'proxy' in path
-                break
-
-        if not server_cmd:
-            return False, "serial_proxy not found"
-
-        try:
-            # Create log directory
-            os.makedirs(LOG_DIR, exist_ok=True)
-
-            if use_proxy:
-                proc = subprocess.Popen(
-                    [server_cmd, '-p', str(port), '-l', LOG_DIR, tty],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
-            else:
-                proc = subprocess.Popen(
-                    [server_cmd, '-p', str(port), tty],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
-
-            time.sleep(0.5)  # Give it time to start
-
-            # Verify it's running
-            if proc.poll() is None:
-                msg = f"Started on port {port}"
-                if use_proxy:
-                    msg += f" (logging to {LOG_DIR})"
-                return True, msg
-            else:
-                return False, "Server exited immediately"
-        except Exception as e:
-            return False, str(e)
-
-    def stop_server(self, tty):
-        """Stop RFC2217 server for device"""
-        running = self.get_running_servers()
-        if tty not in running:
-            return True, "Not running"
-
-        try:
-            os.kill(running[tty]['pid'], signal.SIGTERM)
-            time.sleep(0.3)
-            return True, "Stopped"
-        except Exception as e:
-            return False, str(e)
-
-    def switch_to_flash_mode(self, tty):
-        """Switch to esp_rfc2217_server for fast flashing (no logging)"""
-        # Stop current server
-        self.stop_server(tty)
-        time.sleep(0.5)
-
-        # Get port assignment (using device info for serial-based lookup)
-        device_info = self.get_device_info(tty)
-        config = self.read_config()
-        port = self.assign_port(device_info, config)
-
-        # Find esp_rfc2217_server
-        server_paths = [
-            '/usr/local/bin/esp_rfc2217_server.py',
-            '/usr/local/bin/esp_rfc2217_server',
-            os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
-        ]
-        server_cmd = None
-        for path in server_paths:
-            if os.path.exists(path):
-                server_cmd = path
-                break
-
-        if not server_cmd:
-            return False, "esp_rfc2217_server not found"
-
-        try:
-            subprocess.Popen(
-                [server_cmd, '-p', str(port), tty],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
-            time.sleep(0.5)
-            return True, f"Flash mode on port {port} (no logging, faster)"
-        except Exception as e:
-            return False, str(e)
-
-    def switch_to_log_mode(self, tty):
-        """Switch back to serial-proxy for logging"""
-        # Stop current server
-        self.stop_server(tty)
-        time.sleep(0.5)
-
-        # Start serial-proxy
-        return self.start_server(tty)
-
-    def get_devices(self):
-        """Get all devices with their status"""
-        devices = self.get_serial_devices()
-        config = self.read_config()
-        running = self.get_running_servers()
-
-        result = []
-        for d in devices:
-            tty = d['tty']
-            port = self.assign_port(d, config)  # Pass full device info for serial-based lookup
-            result.append({
-                'tty': tty,
-                'product': d.get('product', ''),
-                'serial': d.get('serial', ''),
-                'port': port,
-                'running': tty in running
-            })
-
-        return result
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path == '/':
-            self.send_html(HTML_TEMPLATE)
-        elif path == '/api/info':
-            self.send_json({'ip': self.get_ip()})
-        elif path == '/api/devices':
-            self.send_json({'devices': self.get_devices()})
-        elif path == '/api/discover':
-            # Simple discovery endpoint - returns list of RFC2217 URLs
-            ip = self.get_ip()
-            devices = self.get_devices()
-            urls = []
-            for d in devices:
-                if d['running']:
-                    urls.append({
-                        'url': f"rfc2217://{ip}:{d['port']}",
-                        'port': d['port'],
-                        'product': d.get('product', ''),
-                        'serial': d.get('serial', ''),
-                        'tty': d['tty']
-                    })
-            self.send_json({'devices': urls})
-        elif path == '/api/logs':
-            # List available log files
-            logs = []
-            if os.path.exists(LOG_DIR):
-                for f in sorted(os.listdir(LOG_DIR), reverse=True):
-                    if f.endswith('.log'):
-                        fpath = os.path.join(LOG_DIR, f)
-                        logs.append({
-                            'name': f,
-                            'size': os.path.getsize(fpath),
-                            'modified': os.path.getmtime(fpath)
-                        })
-            self.send_json({'logs': logs})
-        elif path.startswith('/api/logs/'):
-            # Get log content
-            log_name = path[len('/api/logs/'):]
-            log_path = os.path.join(LOG_DIR, log_name)
-            if os.path.exists(log_path) and log_path.startswith(LOG_DIR):
-                # Get optional tail parameter from query string
-                query = urlparse(self.path).query
-                lines = 100  # Default
-                for param in query.split('&'):
-                    if param.startswith('lines='):
-                        try:
-                            lines = int(param.split('=')[1])
-                        except: pass
-                try:
-                    with open(log_path, 'r') as f:
-                        all_lines = f.readlines()
-                        content = ''.join(all_lines[-lines:])
-                    self.send_json({'content': content, 'total_lines': len(all_lines)})
-                except Exception as e:
-                    self.send_json({'error': str(e)}, 500)
-            else:
-                self.send_json({'error': 'Log not found'}, 404)
+
+        if path == "/api/devices":
+            self._handle_get_devices()
+        elif path == "/api/info":
+            self._handle_get_info()
         else:
-            self.send_json({'error': 'Not found'}, 404)
+            self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        content_len = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(content_len)) if content_len else {}
 
-        if path == '/api/start':
-            tty = body.get('tty', '')
-            if not tty:
-                self.send_json({'success': False, 'error': 'Missing tty'})
-                return
-            ok, msg = self.start_server(tty)
-            self.send_json({'success': ok, 'message': msg})
-
-        elif path == '/api/stop':
-            tty = body.get('tty', '')
-            if not tty:
-                self.send_json({'success': False, 'error': 'Missing tty'})
-                return
-            ok, msg = self.stop_server(tty)
-            self.send_json({'success': ok, 'message': msg})
-
-        elif path == '/api/start-all':
-            results = []
-            for d in self.get_serial_devices():
-                ok, msg = self.start_server(d['tty'])
-                results.append(f"{d['tty']}: {msg}")
-            self.send_json({'success': True, 'messages': results})
-
-        elif path == '/api/stop-all':
-            running = self.get_running_servers()
-            results = []
-            for tty in running:
-                ok, msg = self.stop_server(tty)
-                results.append(f"{tty}: {msg}")
-            self.send_json({'success': True, 'messages': results})
-
-        elif path == '/api/flash-mode':
-            # Switch to esp_rfc2217_server for fast flashing (no logging)
-            tty = body.get('tty', '')
-            if not tty:
-                self.send_json({'success': False, 'error': 'Missing tty'})
-                return
-            ok, msg = self.switch_to_flash_mode(tty)
-            self.send_json({'success': ok, 'message': msg})
-
-        elif path == '/api/log-mode':
-            # Switch back to serial-proxy for logging
-            tty = body.get('tty', '')
-            if not tty:
-                self.send_json({'success': False, 'error': 'Missing tty'})
-                return
-            ok, msg = self.switch_to_log_mode(tty)
-            self.send_json({'success': ok, 'message': msg})
-
+        if path == "/api/hotplug":
+            self._handle_hotplug()
+        elif path == "/api/start":
+            self._handle_start()
+        elif path == "/api/stop":
+            self._handle_stop()
         else:
-            self.send_json({'error': 'Not found'}, 404)
+            self._send_json({"error": "not found"}, 404)
 
-def get_serial_devices_standalone():
-    """Find all serial devices (standalone function)"""
-    devices = []
-    for pattern in ['/dev/ttyUSB*', '/dev/ttyACM*']:
-        for tty in glob.glob(pattern):
-            devices.append(tty)
-    return devices
+    # -- handlers --
 
-def get_device_info_standalone(tty):
-    """Get device info from sysfs (standalone function)"""
-    info = {'tty': tty, 'product': '', 'serial': '', 'vendor': ''}
-    tty_name = os.path.basename(tty)
-    sysfs_path = f"/sys/class/tty/{tty_name}/device"
+    def _handle_get_devices(self):
+        infos = []
+        for slot in slots.values():
+            _refresh_slot_health(slot)
+            infos.append(_slot_info(slot))
+        self._send_json({"slots": infos, "host_ip": host_ip})
 
-    if not os.path.exists(sysfs_path):
-        return info
+    def _handle_get_info(self):
+        self._send_json({
+            "host_ip": host_ip,
+            "slots_configured": sum(1 for s in slots.values() if s["tcp_port"] is not None),
+            "slots_running": sum(1 for s in slots.values() if s["running"]),
+        })
 
-    try:
-        device_path = os.path.realpath(sysfs_path)
-        for _ in range(5):
-            device_path = os.path.dirname(device_path)
-            product_file = os.path.join(device_path, 'product')
-            if os.path.exists(product_file):
-                break
+    def _handle_hotplug(self):
+        global seq_counter
 
-        for attr in ['product', 'serial', 'manufacturer']:
-            attr_file = os.path.join(device_path, attr)
-            if os.path.exists(attr_file):
-                try:
-                    with open(attr_file) as f:
-                        info[attr] = f.read().strip()
-                except: pass
-    except: pass
-    return info
+        body = self._read_json()
+        if body is None:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
 
-def normalize_serial_standalone(serial):
-    """Normalize serial number for use as config key"""
-    if not serial:
-        return ''
-    return serial.replace(':', '_').replace(' ', '_')
+        action = body.get("action")
+        devnode = body.get("devnode")
+        id_path = body.get("id_path", "")
+        devpath = body.get("devpath", "")
 
-def start_server_standalone(tty, config_file=CONFIG_FILE):
-    """Start serial proxy with logging for device (standalone function)"""
-    # Get device info for serial-based port assignment
-    device_info = get_device_info_standalone(tty)
-    serial = normalize_serial_standalone(device_info.get('serial', ''))
+        if not action:
+            self._send_json({"ok": False, "error": "missing action"}, 400)
+            return
 
-    # Read config
-    config = {}
-    if os.path.exists(config_file):
-        try:
-            with open(config_file) as f:
-                for line in f:
-                    if '=' in line and not line.strip().startswith('#'):
-                        key, p = line.strip().split('=', 1)
-                        config[key] = int(p)
-        except: pass
+        slot_key = id_path if id_path else devpath
+        if not slot_key:
+            self._send_json({"ok": False, "error": "missing id_path and devpath"}, 400)
+            return
 
-    # Assign port (prefer serial number for persistence)
-    port = None
-    key = None
+        # Look up or create slot
+        if slot_key not in slots:
+            slots[slot_key] = _make_dynamic_slot(slot_key)
 
-    # 1. Try serial number first
-    if serial and serial in config:
-        port = config[serial]
-        key = serial
-    # 2. Fallback to tty (legacy)
-    elif tty in config:
-        port = config[tty]
-        # Migrate to serial-based key
-        if serial:
-            del config[tty]
-            config[serial] = port
-            key = serial
-        else:
-            key = tty
-    # 3. Assign new port
-    else:
-        used_ports = set(config.values())
-        port = RFC2217_BASE_PORT
-        while port in used_ports:
-            port += 1
-        key = serial if serial else tty
-        config[key] = port
+        slot = slots[slot_key]
+        lock = slot["_lock"]
 
-    # Save config
-    os.makedirs(os.path.dirname(config_file), exist_ok=True)
-    with open(config_file, 'w') as f:
-        f.write("# RFC2217 device-port assignments (by serial number or tty)\n")
-        for k, p in sorted(config.items(), key=lambda x: x[1]):
-            f.write(f"{k}={p}\n")
+        # Update event bookkeeping (always, even for unknown slots)
+        seq_counter += 1
+        slot["seq"] = seq_counter
+        slot["last_action"] = action
+        slot["last_event_ts"] = datetime.now(timezone.utc).isoformat()
 
-    # Check if already running
-    try:
-        for pattern in ['serial.proxy', 'serial_proxy', 'esp_rfc2217_server']:
-            result = subprocess.run(['pgrep', '-a', '-f', pattern],
-                capture_output=True, text=True)
-            if tty in result.stdout:
-                return True, f"Already running on port {port}"
-    except: pass
+        configured = slot["tcp_port"] is not None
 
-    # Find server command (prefer serial_proxy for logging)
-    server_paths = [
-        '/usr/local/bin/serial-proxy',
-        '/usr/local/bin/serial_proxy.py',
-        '/usr/local/bin/esp_rfc2217_server',
-        '/usr/local/bin/esp_rfc2217_server.py',
-        os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
-    ]
-    server_cmd = None
-    use_proxy = False
-    for path in server_paths:
-        if os.path.exists(path):
-            server_cmd = path
-            use_proxy = 'proxy' in path
-            break
+        if action == "add":
+            slot["present"] = True
+            slot["devnode"] = devnode
 
-    if not server_cmd:
-        return False, "serial_proxy not found"
+            if configured:
+                # Start proxy in a background thread so we don't block the
+                # HTTP response for the settle + port-listen check.
+                def _bg_start(s=slot, lk=lock):
+                    with lk:
+                        # Stop existing proxy first if still running
+                        if s["running"] and s["pid"]:
+                            stop_proxy(s)
+                        start_proxy(s)
+                threading.Thread(target=_bg_start, daemon=True).start()
+            else:
+                print(
+                    f"[portal] hotplug: unknown slot_key={slot_key} "
+                    f"(tracked, no proxy)",
+                    flush=True,
+                )
 
-    # Create log directory
+        elif action == "remove":
+            slot["present"] = False
+            if configured and slot["running"]:
+                with lock:
+                    stop_proxy(slot)
+
+        print(
+            f"[portal] hotplug: {action} slot_key={slot_key} "
+            f"devnode={devnode} seq={seq_counter}",
+            flush=True,
+        )
+
+        self._send_json({
+            "ok": True,
+            "slot_key": slot_key,
+            "seq": seq_counter,
+            "accepted": configured,
+        })
+
+    def _handle_start(self):
+        body = self._read_json()
+        if body is None:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+
+        slot_key = body.get("slot_key")
+        devnode = body.get("devnode")
+        if not slot_key or not devnode:
+            self._send_json({"ok": False, "error": "missing slot_key or devnode"}, 400)
+            return
+
+        if slot_key not in slots:
+            self._send_json({"ok": False, "error": "unknown slot_key"}, 404)
+            return
+
+        slot = slots[slot_key]
+        with slot["_lock"]:
+            if slot["running"] and slot["pid"]:
+                stop_proxy(slot)
+            slot["devnode"] = devnode
+            slot["present"] = True
+            ok = start_proxy(slot)
+        self._send_json({"ok": ok, "slot_key": slot_key, "running": slot["running"]})
+
+    def _handle_stop(self):
+        body = self._read_json()
+        if body is None:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+
+        slot_key = body.get("slot_key")
+        if not slot_key:
+            self._send_json({"ok": False, "error": "missing slot_key"}, 400)
+            return
+
+        if slot_key not in slots:
+            self._send_json({"ok": False, "error": "unknown slot_key"}, 404)
+            return
+
+        slot = slots[slot_key]
+        with slot["_lock"]:
+            stop_proxy(slot)
+        self._send_json({"ok": True, "slot_key": slot_key, "running": False})
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    global slots, host_ip
+
+    slots = load_config(CONFIG_FILE)
+    host_ip = get_host_ip()
+
+    # Pre-compute URLs for configured slots
+    for slot in slots.values():
+        if slot["tcp_port"]:
+            slot["url"] = f"rfc2217://{host_ip}:{slot['tcp_port']}"
+
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # Start server
+    addr = ("", PORT)
+    httpd = http.server.HTTPServer(addr, Handler)
+    httpd.allow_reuse_address = True
+    print(
+        f"[portal] v3 listening on http://0.0.0.0:{PORT}  host_ip={host_ip}",
+        flush=True,
+    )
     try:
-        if use_proxy:
-            subprocess.Popen(
-                [server_cmd, '-p', str(port), '-l', LOG_DIR, tty],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
-            return True, f"Started on port {port} (logging)"
-        else:
-            subprocess.Popen(
-                [server_cmd, '-p', str(port), tty],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
-            return True, f"Started on port {port}"
-    except Exception as e:
-        return False, str(e)
-
-def auto_start_all():
-    """Start RFC2217 servers for all connected devices"""
-    devices = get_serial_devices_standalone()
-    for tty in devices:
-        ok, msg = start_server_standalone(tty)
-        print(f"  {tty}: {msg}")
-
-if __name__ == '__main__':
-    print("Starting RFC2217 Portal...")
-
-    # Auto-start servers for all connected devices
-    print("Auto-starting RFC2217 servers:")
-    time.sleep(2)  # Wait for USB devices to settle
-    auto_start_all()
-
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(('', PORT), Handler) as httpd:
-        print(f"Portal running on http://0.0.0.0:{PORT}")
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("[portal] shutting down", flush=True)
+        # Stop all running proxies
+        for slot in slots.values():
+            if slot["running"] and slot["pid"]:
+                stop_proxy(slot)
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
