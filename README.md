@@ -368,6 +368,10 @@ Use `--no-stub` flag:
 esptool --no-stub --port 'rfc2217://PI_IP:4001?ign_set_control' flash_id
 ```
 
+### Hotplug Events Not Reaching Portal
+
+udev runs `RUN+=` handlers inside a network-isolated sandbox (`PrivateNetwork=yes`), so `curl` to `localhost` silently fails. The fix is to wrap the notify script with `systemd-run --no-block` in the udev rule — this runs it outside the sandbox. The included `99-rfc2217-hotplug.rules` already does this. If you write custom rules, make sure to use `systemd-run`.
+
 ### Port Busy
 
 Only one client can connect at a time. Close other connections first.

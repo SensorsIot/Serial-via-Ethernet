@@ -431,6 +431,7 @@ Add this to /etc/rfc2217/slots.json:
 | Unknown slot_key | Portal tracks the slot (present, seq) but does not start a proxy; logged for diagnostics |
 | Hub topology changed | Must re-learn and update config |
 | Device not ready | Settle checks with timeout, then fail |
+| udev PrivateNetwork blocking curl | udev runs RUN+ handlers in a network-isolated sandbox (`PrivateNetwork=yes`). Direct `curl` to localhost silently fails. **Fix:** wrap the notify script with `systemd-run --no-block` in the udev rule so it runs outside the sandbox. This was the root cause of hotplug events never reaching the portal during initial development. |
 
 ---
 
