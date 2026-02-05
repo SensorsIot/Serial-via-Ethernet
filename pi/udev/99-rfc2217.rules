@@ -1,26 +1,10 @@
-# RFC2217 auto-start rules for USB serial devices
-# Starts RFC2217 server when device is plugged in
+# RFC2217 hotplug rules for USB serial devices
+# Uses systemd-run to properly escape udev environment
 
-# CP210x (Silicon Labs)
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", RUN+="/usr/local/bin/rfc2217-hotplug.sh add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove %E{DEVNAME}"
+# ttyACM devices (CDC-ACM: ESP32, Arduino, etc.)
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-hotplug add /dev/%k %E{ID_PATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/local/bin/rfc2217-hotplug remove /dev/%k %E{ID_PATH}"
 
-# CH340/CH341 (QinHeng)
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", RUN+="/usr/local/bin/rfc2217-hotplug.sh add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove %E{DEVNAME}"
-
-# FTDI
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", RUN+="/usr/local/bin/rfc2217-hotplug.sh add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove %E{DEVNAME}"
-
-# ESP32 native USB (Espressif)
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", RUN+="/usr/local/bin/rfc2217-hotplug.sh add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove %E{DEVNAME}"
-
-# Arduino (various)
-ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", RUN+="/usr/local/bin/rfc2217-hotplug.sh add %E{DEVNAME}"
-ACTION=="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove %E{DEVNAME}"
-
-# Generic CDC-ACM (ttyACM devices)
-ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/local/bin/rfc2217-hotplug.sh add /dev/%k"
-ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/local/bin/rfc2217-hotplug.sh remove /dev/%k"
+# ttyUSB devices (FTDI, CP210x, CH340, etc.)
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-hotplug add /dev/%k %E{ID_PATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/local/bin/rfc2217-hotplug remove /dev/%k %E{ID_PATH}"

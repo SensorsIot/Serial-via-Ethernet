@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""
+rfc2217-learn-slots - Discover slot_key for USB serial devices
+
+Run this tool with a device plugged into a USB hub connector to discover
+the ID_PATH (slot_key) for that physical position.
+"""
+
+import subprocess
+import sys
+import glob
+import json
+
+
+def get_udev_info(devnode):
+    """Get udev properties for a device."""
+    try:
+        result = subprocess.run(
+            ['udevadm', 'info', '-q', 'all', devnode],
+            capture_output=True, text=True, check=True
+        )
+        props = {}
+        for line in result.stdout.splitlines():
+            if line.startswith('E: '):
+                key, _, value = line[3:].partition('=')
+                props[key] = value
+        return props
+    except subprocess.CalledProcessError:
+        return None
+
+
+def find_serial_devices():
+    """Find all ttyACM and ttyUSB devices."""
+    devices = []
+    for pattern in ['/dev/ttyACM*', '/dev/ttyUSB*']:
+        devices.extend(glob.glob(pattern))
+    return sorted(devices)
+
+
+def main():
+    devices = find_serial_devices()
+
+    if not devices:
+        print("No serial devices found (ttyACM* or ttyUSB*).")
+        print("Plug a device into the USB hub and try again.")
+        sys.exit(1)
+
+    print(f"Found {len(devices)} serial device(s):\n")
+
+    for devnode in devices:
+        props = get_udev_info(devnode)
+        if not props:
+            print(f"  {devnode}: Could not read udev info")
+            continue
+
+        id_path = props.get('ID_PATH', 'N/A')
+        devpath = props.get('DEVPATH', 'N/A')
+        id_model = props.get('ID_MODEL', 'Unknown')
+        id_serial = props.get('ID_SERIAL_SHORT', props.get('ID_SERIAL', 'N/A'))
+
+        print(f"Device: {devnode}")
+        print(f"  Model:    {id_model}")
+        print(f"  Serial:   {id_serial}")
+        print(f"  ID_PATH:  {id_path}")
+        print(f"  DEVPATH:  {devpath}")
+        print()
+
+        if id_path != 'N/A':
+            slot_config = {
+                "label": "SLOT?",
+                "slot_key": id_path,
+                "tcp_port": 4001
+            }
+            print(f"  Add to /etc/rfc2217/slots.json:")
+            print(f"    {json.dumps(slot_config)}")
+            print()
+
+
+if __name__ == '__main__':
+    main()

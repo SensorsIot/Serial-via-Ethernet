@@ -27,9 +27,6 @@ Expose USB serial devices (ESP32, Arduino) from a Raspberry Pi to network client
 │  ┌───────────┐  │           │  └─────────────────────┘    │
 │  │ SLOT3     │──┼─ :4003    │                             │
 │  └───────────┘  │           │                             │
-│  ┌───────────┐  │           │                             │
-│  │ SLOT4     │──┼─ :4004    │                             │
-│  └───────────┘  │           │                             │
 │                 │           │                             │
 │  Web Portal ────┼─ :8080    │                             │
 └─────────────────┘           └─────────────────────────────┘
@@ -39,8 +36,8 @@ Expose USB serial devices (ESP32, Arduino) from a Raspberry Pi to network client
 
 | Component | Details |
 |-----------|---------|
-| Raspberry Pi | 192.168.0.87 (Serial Pi) |
-| USB Hub | 4-port hub for device connections |
+| Raspberry Pi Zero | 192.168.0.87 (Serial Pi) |
+| USB Hub | 3-port hub connected to single USB port |
 | Devices | ESP32, Arduino, or any USB serial device |
 
 ### 1.4 Components
@@ -119,10 +116,9 @@ This ensures:
 ```json
 {
   "slots": [
-    {"label": "SLOT1", "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0", "tcp_port": 4001},
-    {"label": "SLOT2", "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0", "tcp_port": 4002},
-    {"label": "SLOT3", "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0", "tcp_port": 4003},
-    {"label": "SLOT4", "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0", "tcp_port": 4004}
+    {"label": "SLOT1", "slot_key": "platform-3f980000.usb-usb-0:1.1:1.0", "tcp_port": 4001},
+    {"label": "SLOT2", "slot_key": "platform-3f980000.usb-usb-0:1.3:1.0", "tcp_port": 4002},
+    {"label": "SLOT3", "slot_key": "platform-3f980000.usb-usb-0:1.4:1.0", "tcp_port": 4003}
   ]
 }
 ```
@@ -193,7 +189,7 @@ This ensures:
 ### 3.5 Web Portal (FR-005)
 
 **Required Behavior:**
-- Display all 4 slots (always visible, even if empty)
+- Display all 3 slots (always visible, even if empty)
 - Show slot status (running/stopped)
 - Show current devnode when running
 - Start/stop individual slots
@@ -328,7 +324,6 @@ StandardError=journal
 | 4001 | SLOT1 RFC2217 |
 | 4002 | SLOT2 RFC2217 |
 | 4003 | SLOT3 RFC2217 |
-| 4004 | SLOT4 RFC2217 |
 
 ---
 
