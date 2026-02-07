@@ -1,0 +1,697 @@
+# Serial Portal — Functional Specification Document
+
+## 1. Overview
+
+### 1.1 Purpose
+
+Combined serial interface and WiFi test instrument running on a single
+Raspberry Pi Zero W.  The serial interface exposes USB serial devices to
+network clients via RFC2217 protocol with event-driven hotplug and slot-based
+port assignment.  The WiFi tester uses the Pi's onboard wlan0 radio as a
+test instrument — starting SoftAP, joining networks, scanning, relaying HTTP,
+and reporting station events — all controlled over the same HTTP API.
+
+### 1.2 System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          Network (192.168.0.x)                           │
+└──────────────────────────────────────────────────────────────────────────┘
+       │  eth0 (USB Ethernet)                          │
+       │                                               │
+       ▼                                               ▼
+┌─────────────────────────┐              ┌─────────────────────────────────┐
+│  Serial Portal Pi       │              │  VM Host (192.168.0.160)        │
+│  192.168.0.87           │              │                                 │
+│                         │              │  ┌─────────────────────┐        │
+│  ┌───────────┐          │              │  │ Container A         │        │
+│  │ SLOT1     │──────────┼─ :4001 ──────┼──│ rfc2217://:4001     │        │
+│  └───────────┘          │              │  └─────────────────────┘        │
+│  ┌───────────┐          │              │  ┌─────────────────────┐        │
+│  │ SLOT2     │──────────┼─ :4002 ──────┼──│ Container B         │        │
+│  └───────────┘          │              │  │ rfc2217://:4002     │        │
+│  ┌───────────┐          │              │  └─────────────────────┘        │
+│  │ SLOT3     │──────────┼─ :4003       │                                 │
+│  └───────────┘          │              └─────────────────────────────────┘
+│                         │
+│  ┌───────────────────┐  │
+│  │ WiFi Tester       │  │
+│  │ wlan0 (onboard)   │  │
+│  │  AP: 192.168.4.1  │  │
+│  │  STA / Scan       │  │
+│  └───────────────────┘  │
+│                         │
+│  Web Portal ────────────┼─ :8080
+└─────────────────────────┘
+```
+
+### 1.3 Hardware
+
+| Component | Details |
+|-----------|---------|
+| Raspberry Pi Zero W | 192.168.0.87, onboard wlan0 radio |
+| USB Hub | 3-port hub connected to single USB port |
+| USB Ethernet adapter | eth0 — wired LAN for management and serial traffic |
+| Devices | ESP32, Arduino, or any USB serial device |
+
+### 1.4 Operating Modes
+
+The system operates in one of two modes at any time:
+
+| Mode | Default | eth0 | wlan0 | Serial | WiFi Tester |
+|------|---------|------|-------|--------|-------------|
+| **WiFi-Testing** | Yes | LAN (management + serial) | Test instrument (AP/STA/scan) | Active | Active |
+| **Serial Interface** | No | LAN (management + serial) | Joins WiFi for additional LAN | Active | Disabled |
+
+- **WiFi-Testing** (default): eth0 provides wired LAN connectivity.  wlan0 is
+  dedicated to the WiFi test instrument — it can start a SoftAP, join external
+  networks, scan, and relay HTTP.  Both serial slots and WiFi tester are active.
+
+- **Serial Interface**: wlan0 joins a user-specified WiFi network to provide
+  wireless LAN connectivity (useful when no wired Ethernet is available).
+  Serial slots remain active.  WiFi tester endpoints return an error.
+
+Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
+
+### 1.5 Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| portal.py (rfc2217-portal) | /usr/local/bin/rfc2217-portal | Web UI, HTTP API, proxy supervisor, hotplug handler, WiFi API |
+| wifi_controller.py | /usr/local/bin/wifi_controller.py | WiFi instrument backend (AP, STA, scan, relay, events) |
+| esp_rfc2217_server.py | /usr/local/bin/esp_rfc2217_server.py | RFC2217 server from esptool (preferred, stable) |
+| serial_proxy.py | /usr/local/bin/serial_proxy.py | RFC2217 server with logging (fallback) |
+| rfc2217-udev-notify.sh | /usr/local/bin/rfc2217-udev-notify.sh | Posts udev events to portal API |
+| wifi-lease-notify.sh | /usr/local/bin/wifi-lease-notify.sh | Posts dnsmasq DHCP lease events to portal API |
+| rfc2217-learn-slots | /usr/local/bin/rfc2217-learn-slots | Slot configuration helper |
+| 99-rfc2217-hotplug.rules | /etc/udev/rules.d/ | udev rules for hotplug |
+| slots.json | /etc/rfc2217/slots.json | Slot-to-port mapping |
+| wifi_tester_driver.py | pytest/ | HTTP test driver for the WiFi instrument |
+| conftest.py | pytest/ | Pytest fixtures and CLI options |
+| test_instrument.py | pytest/ | WiFi tester self-tests (WT-xxx) |
+
+---
+
+## 2. Definitions
+
+| Entity | Description |
+|--------|-------------|
+| **Slot** | One physical connector position on the USB hub |
+| **slot_key** | Stable identifier for physical port topology (derived from udev `ID_PATH`) |
+| **devnode** | Current tty device path (e.g., `/dev/ttyACM0`) — may change on reconnect |
+| **proxy** | RFC2217 server process for a serial device (`esp_rfc2217_server.py` preferred, `serial_proxy.py` fallback) |
+| **seq** (sequence) | Global monotonically increasing counter, incremented on every hotplug event |
+| **Mode** | Operating mode: `wifi-testing` (wlan0 = instrument) or `serial-interface` (wlan0 = LAN) |
+
+### Key Principle: Slot-Based Identity
+
+The system keys on physical connector position, NOT on `/dev/ttyACMx`
+(changes on reconnect), serial number (two identical boards would conflict),
+or VID/PID (not unique).
+
+`slot_key` = udev `ID_PATH` ensures:
+- Same physical connector → same TCP port (always)
+- Device can be swapped → same TCP port
+- Two identical boards → different TCP ports (different slots)
+
+---
+
+## 3. Serial Interface
+
+### FR-001 — Event-Driven Hotplug
+
+**Plug flow:**
+1. udev emits `add` event for the serial device
+2. udev rule invokes `rfc2217-udev-notify.sh` via `systemd-run --no-block`
+3. Notify script sends `POST /api/hotplug` with `{action, devnode, id_path, devpath}`
+4. Portal determines `slot_key` from `id_path` (or `devpath` fallback)
+5. Portal increments global `seq_counter`, records event metadata on the slot
+6. Portal spawns a background thread that acquires the slot lock, waits for the device to settle, then starts the proxy bound to `devnode` on the configured TCP port
+7. Slot state becomes `running=true`, `present=true`
+
+**Unplug flow:**
+1. udev emits `remove` event
+2–4. Same notification path as plug
+5. Portal increments `seq_counter`, records metadata
+6. Portal stops the proxy process for that slot (idempotent)
+7. Slot state becomes `running=false`, `present=false`
+
+**Boot scan:** On startup, portal scans `/dev/ttyACM*` and `/dev/ttyUSB*`,
+queries `udevadm info` for each, and starts proxies for any device matching a
+configured slot.
+
+### FR-002 — Slot Configuration
+
+Static configuration maps `slot_key` → `{label, tcp_port}`.
+
+Configuration file: `/etc/rfc2217/slots.json`
+
+```json
+{
+  "slots": [
+    {"label": "SLOT1", "slot_key": "platform-3f980000.usb-usb-0:1.1:1.0", "tcp_port": 4001},
+    {"label": "SLOT2", "slot_key": "platform-3f980000.usb-usb-0:1.3:1.0", "tcp_port": 4002},
+    {"label": "SLOT3", "slot_key": "platform-3f980000.usb-usb-0:1.4:1.0", "tcp_port": 4003}
+  ]
+}
+```
+
+### FR-003 — Serial API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/devices | List all slots with status |
+| POST | /api/hotplug | Receive udev hotplug event (add/remove) |
+| POST | /api/start | Manually start proxy for a slot |
+| POST | /api/stop | Manually stop proxy for a slot |
+| GET | /api/info | Pi IP, hostname, slot counts |
+
+**GET /api/devices** returns:
+
+```json
+{
+  "slots": [
+    {
+      "label": "SLOT1",
+      "slot_key": "platform-...-usb-0:1.1:1.0",
+      "tcp_port": 4001,
+      "present": true,
+      "running": true,
+      "devnode": "/dev/ttyACM0",
+      "pid": 1234,
+      "url": "rfc2217://192.168.0.87:4001",
+      "seq": 5,
+      "last_action": "add",
+      "last_event_ts": "2026-02-05T12:34:56+00:00",
+      "last_error": null
+    }
+  ],
+  "host_ip": "192.168.0.87",
+  "hostname": "serial1"
+}
+```
+
+**POST /api/hotplug** body: `{action, devnode, id_path, devpath}`.
+
+**POST /api/start** body: `{slot_key, devnode}`.
+
+**POST /api/stop** body: `{slot_key}`.
+
+### FR-004 — Serial Traffic Logging
+
+- All serial traffic logged with timestamps to `/var/log/serial/`
+- Log format: `[timestamp] [direction] data`
+- Only active when using `serial_proxy.py` (fallback proxy)
+
+### FR-005 — Web Portal (Serial Section)
+
+- Display all 3 slots (always visible, even if empty)
+- Show slot status: RUNNING / PRESENT / EMPTY
+- Show current devnode and PID when running
+- Copy RFC2217 URL to clipboard (hostname and IP variants)
+- Start/stop individual slots
+- Display connection examples
+
+---
+
+## 4. WiFi Tester
+
+### FR-010 — WiFi API
+
+All WiFi endpoints are prefixed `/api/wifi/`.  Tester endpoints (all except
+`/api/wifi/mode` and `/api/wifi/ping`) return `{"ok": false, "error": "WiFi
+testing disabled (Serial Interface mode)"}` when the system is in
+serial-interface mode.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/wifi/ping | Version and uptime |
+| GET | /api/wifi/mode | Current operating mode |
+| POST | /api/wifi/mode | Switch operating mode |
+| POST | /api/wifi/ap_start | Start SoftAP |
+| POST | /api/wifi/ap_stop | Stop SoftAP |
+| GET | /api/wifi/ap_status | AP status, SSID, channel, stations |
+| POST | /api/wifi/sta_join | Join WiFi network as station |
+| POST | /api/wifi/sta_leave | Disconnect from WiFi network |
+| GET | /api/wifi/scan | Scan for WiFi networks |
+| POST | /api/wifi/http | HTTP relay through Pi's radio |
+| GET | /api/wifi/events | Event queue (long-poll supported) |
+| POST | /api/wifi/lease_event | Receive dnsmasq lease callback |
+
+### FR-011 — SoftAP Management
+
+The Pi's wlan0 runs hostapd + dnsmasq to create a SoftAP:
+
+- **SSID/password/channel** configurable per `POST /api/wifi/ap_start`
+- **IP addressing:** AP IP is `192.168.4.1/24`
+- **DHCP range:** `192.168.4.2` – `192.168.4.20`, 1-hour leases
+- **Station tracking:** dnsmasq calls `wifi-lease-notify.sh` on DHCP events
+  (add/old/del), which posts to `POST /api/wifi/lease_event`.  The portal
+  maintains an in-memory station table `{mac, ip}` and emits STA_CONNECT /
+  STA_DISCONNECT events.
+- **AP status** (`GET /api/wifi/ap_status`): returns `{active, ssid, channel, stations[]}`
+- Starting AP while AP is already running restarts with new configuration
+- AP and STA are mutually exclusive — starting one stops the other
+
+### FR-012 — STA Mode
+
+Join an external WiFi network using wpa_supplicant + DHCP:
+
+- `POST /api/wifi/sta_join` with `{ssid, pass, timeout}`
+- Portal writes wpa_supplicant.conf, starts wpa_supplicant, polls
+  `wpa_cli status` until `wpa_state=COMPLETED`, then obtains IP via
+  `dhclient` (or `udhcpc` fallback)
+- Returns `{ip, gateway}` on success; raises error on timeout or no IP
+- `POST /api/wifi/sta_leave` disconnects and releases DHCP
+- STA and AP are mutually exclusive — starting STA stops the AP
+
+### FR-013 — WiFi Scan
+
+- `GET /api/wifi/scan` uses `iw dev wlan0 scan -u`
+- Returns `{networks: [{ssid, rssi, auth}, ...]}` sorted by signal strength
+- `auth` is one of: `OPEN`, `WPA`, `WPA2`, `WEP`
+- Scan works while AP is running (the AP's own SSID is excluded from results)
+
+### FR-014 — HTTP Relay
+
+Proxy HTTP requests through the Pi's radio so tests can reach devices on the
+WiFi side of the network:
+
+- `POST /api/wifi/http` with `{method, url, headers, body, timeout}`
+- Request body is base64-encoded; response body is returned base64-encoded
+- Returns `{status, headers, body}`
+- Works in both AP mode (reaching devices at 192.168.4.x) and STA mode
+  (reaching the external network)
+
+### FR-015 — Event System
+
+- Events: `STA_CONNECT` (mac, ip, hostname) and `STA_DISCONNECT` (mac)
+- `GET /api/wifi/events` drains the event queue
+- Long-poll: `GET /api/wifi/events?timeout=N` blocks up to N seconds if queue
+  is empty, returning immediately when an event arrives
+
+### FR-016 — Mode Switching
+
+- `POST /api/wifi/mode` with `{mode, ssid?, pass?}`
+- Switching to `serial-interface` requires `ssid` (and optional `pass`);
+  stops any active AP/STA, then joins the specified WiFi network via
+  wpa_supplicant + DHCP on wlan0
+- Switching to `wifi-testing` disconnects wlan0 from WiFi, returns wlan0 to
+  instrument duty
+- Mode switch failure (e.g., can't join WiFi) reverts to `wifi-testing`
+- `GET /api/wifi/mode` returns `{mode}` (and `ssid`, `ip` when in
+  serial-interface mode)
+- While in serial-interface mode, tester endpoints (`ap_start`, `ap_stop`,
+  `sta_join`, `sta_leave`, `scan`, `http`) return a guard error
+
+---
+
+## 5. Web Portal
+
+The portal serves a single-page HTML UI at `GET /` (port 8080):
+
+- **Serial slot cards** — one card per configured slot showing label, status
+  badge (RUNNING/PRESENT/EMPTY), devnode, PID, and copyable RFC2217 URL
+- **WiFi Tester section** — mode toggle (WiFi-Testing / Serial Interface),
+  AP status (SSID, channel, station count), and mode-specific information
+- **Mode toggle** — clicking "Serial Interface" prompts for SSID/password;
+  clicking "WiFi-Testing" switches back immediately
+- **Auto-refresh** — every 2 seconds via `setInterval`, fetches
+  `/api/devices`, `/api/wifi/mode`, and `/api/wifi/ap_status`
+- **Title** — shows `{hostname} — Serial Portal` when hostname is available
+
+---
+
+## 6. Non-Functional Requirements
+
+### 6.1 Must Tolerate
+
+| Scenario | How Handled |
+|----------|-------------|
+| `/dev/ttyACM0` → `/dev/ttyACM1` renaming | slot_key unchanged (based on physical port) |
+| Duplicate udev events | API idempotency, per-slot locking |
+| "Remove after add" races (USB reset) | Per-slot locking serializes operations; sequence counter aids diagnostics |
+| Two identical boards | Different slot_keys (different physical connectors) |
+| Hub/Pi reboot | Static config preserves port assignments; boot scan starts proxies |
+
+### 6.2 Determinism
+
+- Same physical connector → same TCP port (always)
+- Configuration survives reboots
+- No dynamic port assignment
+
+### 6.3 Reliability
+
+- Portal API must be idempotent
+- Actions serialized per slot (threading.Lock)
+- Stale events prevented via per-slot locking; sequence counter for observability
+
+### 6.4 WiFi Mutual Exclusivity
+
+- AP and STA are mutually exclusive — starting one stops the other
+- Mode guard prevents tester endpoints from running in serial-interface mode;
+  guarded endpoints return HTTP 200 with `{"ok": false, "error": "WiFi testing
+  disabled (Serial Interface mode)"}`
+
+### 6.5 Edge Cases
+
+| Case | Behavior |
+|------|----------|
+| Two identical boards | Works — different slot_keys (different physical connectors) |
+| Device re-enumeration (USB reset) | Per-slot locking serializes add/remove; background thread restart is safe |
+| Duplicate events | Idempotency prevents flapping |
+| Unknown slot_key | Portal tracks the slot (present, seq) but does not start a proxy; logged for diagnostics |
+| Hub topology changed | Must re-learn slots and update config |
+| Device not ready | Settle checks with timeout, then fail with `last_error` |
+| udev PrivateNetwork blocking curl | udev runs RUN+ handlers in a network-isolated sandbox (`PrivateNetwork=yes`). Direct `curl` to localhost silently fails. Fix: wrap the notify script with `systemd-run --no-block` in the udev rule so it runs outside the sandbox. |
+
+---
+
+## 7. Test Cases
+
+### 7.1 Serial Tests
+
+| ID | Name | Pass Criteria |
+|----|------|---------------|
+| TC-001 | Plug into SLOT3 | SLOT3 shows `running=true`, `devnode` set, `tcp_port=4003` within 5 s |
+| TC-002 | Unplug from SLOT3 | SLOT3 shows `running=false`, `devnode=null` within 2 s |
+| TC-003 | Replug into SLOT3 | SLOT3 `running=true`, same `tcp_port=4003`, devnode may differ |
+| TC-004 | Two identical boards | Both running on different TCP ports (4001, 4002) |
+| TC-005 | USB reset race | No "stuck stopped" state; per-slot locking serializes events |
+| TC-006 | Devnode renaming | Original device still on SLOT1's port (4001) after renumbering |
+| TC-007 | Boot persistence | Same slots get same ports after reboot |
+| TC-008 | Unknown slot | Portal logs "unknown slot_key", no crash |
+
+### 7.2 WiFi Tester Tests
+
+Tests are implemented in `pytest/test_instrument.py` and run via:
+```
+pytest test_instrument.py --wt-url http://<pi-ip>:8080
+```
+
+Add `--run-dut` to include tests that require a WiFi device under test.
+
+| ID | Name | Category | Requires DUT |
+|----|------|----------|:------------:|
+| WT-100 | Ping response | Basic Protocol | No |
+| WT-104 | Rapid commands | Basic Protocol | No |
+| WT-200 | Start AP | SoftAP | No |
+| WT-201 | Start open AP | SoftAP | No |
+| WT-202 | Stop AP | SoftAP | No |
+| WT-203 | Stop when not running | SoftAP | No |
+| WT-204 | Restart AP new config | SoftAP | No |
+| WT-205 | AP status when running | SoftAP | No |
+| WT-206 | AP status when stopped | SoftAP | No |
+| WT-207 | Max SSID length (32) | SoftAP | No |
+| WT-208 | Channel selection | SoftAP | No |
+| WT-300 | Station connect event | Station Events | Yes |
+| WT-301 | Station disconnect event | Station Events | Yes |
+| WT-302 | Station in AP status | Station Events | Yes |
+| WT-303 | IP matches event | Station Events | Yes |
+| WT-400 | Join open network | STA Mode | Yes |
+| WT-401 | Join WPA2 network | STA Mode | Yes |
+| WT-402 | Wrong password | STA Mode | Yes |
+| WT-403 | Nonexistent SSID | STA Mode | No |
+| WT-404 | Leave STA | STA Mode | Yes |
+| WT-405 | AP stops during STA | STA Mode | Yes |
+| WT-500 | GET request | HTTP Relay | Yes |
+| WT-501 | POST with body | HTTP Relay | Yes |
+| WT-502 | Custom headers | HTTP Relay | Yes |
+| WT-503 | Connection refused | HTTP Relay | No* |
+| WT-504 | Request timeout | HTTP Relay | No* |
+| WT-505 | Large response | HTTP Relay | Yes |
+| WT-506 | HTTP via STA mode | HTTP Relay | Yes |
+| WT-600 | Scan finds networks | WiFi Scan | No |
+| WT-601 | Scan returns fields | WiFi Scan | No |
+| WT-602 | Own AP excluded | WiFi Scan | No |
+| WT-603 | Scan while AP running | WiFi Scan | No |
+
+\* WT-503/504 require a running AP (wifi_network fixture) but not a physical DUT.
+
+---
+
+## 8. Revision History
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | 2026-02-05 | Claude | Initial FSD (serial only) |
+| 1.1 | 2026-02-05 | Claude | Implemented serial-based port assignment |
+| 1.2 | 2026-02-05 | Claude | Testing complete for serial-based approach |
+| 2.0 | 2026-02-05 | Claude | Major rewrite: event-driven slot-based architecture |
+| 3.0 | 2026-02-05 | Claude | Portal v3: direct hotplug handling, in-memory seq + locking, systemd-run udev |
+| 4.0 | 2026-02-07 | Claude | WiFi Tester integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
+
+---
+
+## Appendix A: Technical Details
+
+### A.1 Slot Key Derivation
+
+```python
+def get_slot_key(udev_env):
+    """Derive slot_key from udev environment variables."""
+    # Preferred: ID_PATH (stable across reboots)
+    if 'ID_PATH' in udev_env and udev_env['ID_PATH']:
+        return udev_env['ID_PATH']
+
+    # Fallback: DEVPATH (less stable but usable)
+    if 'DEVPATH' in udev_env:
+        return udev_env['DEVPATH']
+
+    raise ValueError("Cannot determine slot_key: no ID_PATH or DEVPATH")
+```
+
+### A.2 Sequence Counter
+
+The portal owns a single global monotonic `seq_counter` in memory (no files
+on disk).  Every hotplug event increments the counter and stamps the affected
+slot:
+
+```python
+# Module-level state (in portal.py)
+seq_counter: int = 0
+
+# Inside _handle_hotplug:
+seq_counter += 1
+slot["seq"] = seq_counter
+slot["last_action"] = action       # "add" or "remove"
+slot["last_event_ts"] = datetime.now(timezone.utc).isoformat()
+```
+
+The sequence number provides a total ordering of events for diagnostics.
+Because the portal processes hotplug requests serially per slot (via per-slot
+locks), stale-event races are prevented by locking rather than by comparing
+counters.
+
+### A.3 API Idempotency
+
+**POST /api/start semantics:**
+- If slot running with same devnode: return OK (no restart)
+- If slot running with different devnode: restart cleanly
+- If slot not running: start
+- Never fails if already in desired state
+
+**POST /api/stop semantics:**
+- If slot not running: return OK
+- If running: stop
+- Never fails if already in desired state
+
+### A.4 Per-Slot Locking
+
+Portal serializes operations per slot using in-memory `threading.Lock` objects:
+
+```python
+# Each slot dict holds its own lock (created at config load time)
+slot["_lock"] = threading.Lock()
+
+# Usage (e.g., inside hotplug add handler):
+with slot["_lock"]:
+    stop_proxy(slot)   # stop old proxy if running
+    start_proxy(slot)  # start new proxy
+```
+
+No file-based locks or `/run/rfc2217/locks/` directory is used.
+
+### A.5 Device Settle Checks
+
+The portal's `start_proxy` function performs settle checks inline (no separate
+handler).  It polls the device node before launching the proxy:
+
+```python
+def wait_for_device(devnode, timeout=5.0):
+    """Wait for device to be usable (called inside portal)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(devnode):
+            try:
+                fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
+                os.close(fd)
+                return True
+            except OSError:
+                pass
+        time.sleep(0.1)
+    return False
+```
+
+If the device does not settle within the timeout, the slot's `last_error` is
+set and the proxy is not started.
+
+### A.6 udev Rules
+
+```
+# /etc/udev/rules.d/99-rfc2217-hotplug.rules
+# Notify portal of USB serial add/remove events.
+# systemd-run escapes udev's PrivateNetwork sandbox so curl can reach localhost.
+
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyACM*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+ACTION=="remove", SUBSYSTEM=="tty", KERNEL=="ttyUSB*", RUN+="/usr/bin/systemd-run --no-block /usr/local/bin/rfc2217-udev-notify.sh %E{ACTION} %E{DEVNAME} %E{ID_PATH} %E{DEVPATH}"
+```
+
+The udev notify script posts a JSON payload to the portal:
+
+```bash
+#!/bin/bash
+# /usr/local/bin/rfc2217-udev-notify.sh
+# Args: ACTION DEVNAME ID_PATH DEVPATH
+
+curl -m 2 -s -X POST http://127.0.0.1:8080/api/hotplug \
+  -H 'Content-Type: application/json' \
+  -d "{\"action\":\"$1\",\"devnode\":\"$2\",\"id_path\":\"${3:-}\",\"devpath\":\"$4\"}" \
+  || true
+```
+
+### A.7 WiFi Lease Notify Script
+
+dnsmasq calls this script on DHCP lease events (add/old/del):
+
+```bash
+#!/bin/sh
+# /usr/local/bin/wifi-lease-notify.sh
+# Args: ACTION MAC IP HOSTNAME
+
+curl -s -X POST -H "Content-Type: application/json" \
+     -d "{\"action\":\"${1}\",\"mac\":\"${2}\",\"ip\":\"${3}\",\"hostname\":\"${4:-}\"}" \
+     --max-time 2 "http://127.0.0.1:8080/api/wifi/lease_event" >/dev/null 2>&1 || true
+```
+
+### A.8 systemd Service
+
+The portal runs as a long-lived systemd service.  udev events are delivered
+via `systemd-run` and the notify script (see A.6).
+
+```ini
+# /etc/systemd/system/rfc2217-portal.service
+[Unit]
+Description=RFC2217 Portal
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/rfc2217-portal
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### A.9 Network Ports
+
+| Port | Service |
+|------|---------|
+| 8080 | Web portal and API |
+| 4001 | SLOT1 RFC2217 |
+| 4002 | SLOT2 RFC2217 |
+| 4003 | SLOT3 RFC2217 |
+
+### A.10 WiFi Configuration Constants
+
+| Constant | Value |
+|----------|-------|
+| WLAN_IF | `wlan0` (env: `WIFI_WLAN_IF`) |
+| AP_IP | `192.168.4.1` |
+| AP_NETMASK | `255.255.255.0` |
+| AP_SUBNET | `192.168.4.0/24` |
+| DHCP_RANGE_START | `192.168.4.2` |
+| DHCP_RANGE_END | `192.168.4.20` |
+| DHCP_LEASE_TIME | `1h` |
+| WORK_DIR | `/tmp/wifi-tester` |
+| VERSION | `1.0.0-pi` |
+
+---
+
+## Appendix B: Slot Learning Workflow
+
+### B.1 Tool: rfc2217-learn-slots
+
+```bash
+$ rfc2217-learn-slots
+Plug a device into the USB hub connector you want to identify...
+
+Detected device:
+  DEVNAME:  /dev/ttyACM0
+  ID_PATH:  platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0
+  DEVPATH:  /devices/platform/scb/fd500000.pcie/.../ttyACM0
+  BY-PATH:  /dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0
+
+Add this to /etc/rfc2217/slots.json:
+  {"label": "SLOT?", "slot_key": "platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0", "tcp_port": 400?}
+```
+
+### B.2 Initial Setup Procedure
+
+1. Start with empty `slots.json`
+2. Plug device into first hub connector
+3. Run `rfc2217-learn-slots`, note the `ID_PATH`
+4. Add to config as SLOT1 with `tcp_port: 4001`
+5. Repeat for each hub connector
+6. Restart portal service
+
+---
+
+## Appendix C: Implementation Tasks & Deliverables
+
+### C.1 Tasks
+
+**Serial:**
+- [x] TASK-001: Create slot-based configuration loader
+- [x] TASK-002: Implement sequence counter in portal
+- [x] TASK-003: Implement per-slot locking (threading.Lock)
+- [x] TASK-004: Implement POST /api/hotplug endpoint
+- [x] TASK-005: Implement device settle checks in start_proxy
+- [x] TASK-006: Create rfc2217-udev-notify.sh script
+- [x] TASK-007: Create 99-rfc2217-hotplug.rules (systemd-run based)
+- [x] TASK-008: Create rfc2217-learn-slots tool
+- [x] TASK-009: Update web UI to show slot-based view
+- [x] TASK-010: Boot scan for already-plugged devices
+- [ ] TASK-011: Test all test cases
+- [ ] TASK-012: Deploy to Serial Pi (192.168.0.87)
+
+**WiFi:**
+- [x] TASK-020: Implement wifi_controller.py (AP, STA, scan, relay, events)
+- [x] TASK-021: Add WiFi API routes to portal.py
+- [x] TASK-022: Implement mode switching (wifi-testing / serial-interface)
+- [x] TASK-023: Create wifi-lease-notify.sh for dnsmasq callbacks
+- [x] TASK-024: Create wifi_tester_driver.py (HTTP test driver)
+- [x] TASK-025: Create conftest.py + test_instrument.py (WT-xxx tests)
+- [x] TASK-026: Add WiFi section to web UI with mode toggle
+
+### C.2 Deliverables
+
+| Deliverable | Description |
+|-------------|-------------|
+| `portal.py` | HTTP server with serial slot management, WiFi API, process supervision, hotplug handling |
+| `wifi_controller.py` | WiFi instrument backend (hostapd, dnsmasq, wpa_supplicant, iw, HTTP relay) |
+| `esp_rfc2217_server.py` | RFC2217 server from esptool (preferred — stable, supports flashing) |
+| `serial_proxy.py` | RFC2217 proxy with serial traffic logging (fallback) |
+| `rfc2217-udev-notify.sh` | Posts udev events to portal API via curl |
+| `wifi-lease-notify.sh` | Posts dnsmasq DHCP lease events to portal API |
+| `rfc2217-learn-slots` | CLI tool to discover slot_key for physical connectors |
+| `99-rfc2217-hotplug.rules` | udev rules using systemd-run to invoke notify script |
+| `rfc2217-portal.service` | systemd unit for the portal |
+| `slots.json` | Slot configuration file |
+| `wifi_tester_driver.py` | HTTP driver for running WT-xxx tests against the instrument |
+| `conftest.py` | Pytest fixtures (`wifi_tester`, `wifi_network`, `--wt-url`, `--run-dut`) |
+| `test_instrument.py` | WiFi tester self-tests (32 test cases, WT-100 through WT-603) |
