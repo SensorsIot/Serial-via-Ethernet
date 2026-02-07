@@ -1,50 +1,50 @@
-# ESP32 Serial Sharing Setup Guide
+# Serial Portal Setup Guide
 
-Complete guide for sharing ESP32 serial devices from a Raspberry Pi to containers via RFC2217.
+Complete guide for setting up the Serial Portal on a Raspberry Pi Zero W — sharing USB serial devices over the network via RFC2217 and using the onboard WiFi radio as a test instrument.
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            Proxmox Host                                 │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                              VM                                   │  │
-│  │  ┌─────────────────────┐       ┌─────────────────────┐           │  │
-│  │  │    Container A      │       │    Container B      │           │  │
-│  │  │                     │       │                     │           │  │
-│  │  │  discover.py        │       │  discover.py        │           │  │
-│  │  │  rfc2217://pi:4001  │       │  rfc2217://pi:4002  │           │  │
-│  │  └──────────┬──────────┘       └──────────┬──────────┘           │  │
-│  │             │                             │                       │  │
-│  └─────────────┼─────────────────────────────┼───────────────────────┘  │
-│                │           TCP               │                          │
-└────────────────┼─────────────────────────────┼──────────────────────────┘
-                 │                             │
-                 ▼                             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Raspberry Pi Zero                               │
-│                                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────────┐  │
-│  │   Portal    │  │    udev     │  │      esp_rfc2217_server        │  │
-│  │   :8080     │  │   rules     │  │  :4001 ◄── /dev/ttyUSB0 ◄── ESP32 #1
-│  │             │  │             │  │  :4002 ◄── /dev/ttyUSB1 ◄── ESP32 #2
-│  │ /api/discover│ │  hotplug    │  │                                 │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────────────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          Network (192.168.0.x)                           │
+└──────────────────────────────────────────────────────────────────────────┘
+       │  eth0 (USB Ethernet)                          │
+       │                                               │
+       ▼                                               ▼
+┌─────────────────────────┐              ┌─────────────────────────────────┐
+│  Serial Portal Pi       │              │  VM Host / Containers           │
+│  192.168.0.87           │              │                                 │
+│                         │              │  ┌─────────────────────┐        │
+│  ┌───────────┐          │              │  │ Container A         │        │
+│  │ SLOT1     │──────────┼─ :4001 ──────┼──│ rfc2217://:4001     │        │
+│  └───────────┘          │              │  └─────────────────────┘        │
+│  ┌───────────┐          │              │  ┌─────────────────────┐        │
+│  │ SLOT2     │──────────┼─ :4002 ──────┼──│ Container B         │        │
+│  └───────────┘          │              │  │ rfc2217://:4002     │        │
+│  ┌───────────┐          │              │  └─────────────────────┘        │
+│  │ SLOT3     │──────────┼─ :4003       │                                 │
+│  └───────────┘          │              └─────────────────────────────────┘
+│                         │
+│  ┌───────────────────┐  │
+│  │ WiFi Tester       │  │
+│  │ wlan0 (onboard)   │  │
+│  │  AP: 192.168.4.1  │  │
+│  └───────────────────┘  │
+│                         │
+│  Web Portal ────────────┼─ :8080
+└─────────────────────────┘
 ```
 
 ## How RFC2217 Works
 
-RFC2217 is a Telnet protocol extension that allows serial port control over TCP/IP. The `esp_rfc2217_server` (from esptool) creates a TCP socket that bridges to a local serial device.
+RFC2217 is a Telnet protocol extension that allows serial port control over TCP/IP. The Pi runs an RFC2217 server per USB serial device, each on a fixed TCP port determined by which physical USB hub connector (slot) the device is plugged into.
 
 **Benefits over USB/IP:**
 - No kernel modules required
 - No VM configuration needed
 - Works through firewalls (just TCP)
-- Simpler and more reliable
 - Native support in esptool, pyserial, PlatformIO
 
 **Limitations:**
@@ -62,53 +62,67 @@ RFC2217 is a Telnet protocol extension that allows serial port control over TCP/
 # Update system
 sudo apt update && sudo apt upgrade -y
 
-# Install Python and curl
-sudo apt install -y python3-pip curl
+# Install Python, curl, and WiFi tools
+sudo apt install -y python3-pip curl hostapd dnsmasq iw wpasupplicant
 
 # Install esptool (includes esp_rfc2217_server)
 sudo pip3 install esptool --break-system-packages
 ```
 
-### Verify esptool Installation
-
-```bash
-# Check esp_rfc2217_server is available
-which esp_rfc2217_server.py
-
-# Should output something like:
-# /usr/local/bin/esp_rfc2217_server.py
-```
-
-### Install Portal and Scripts
+### Install with install.sh
 
 ```bash
 # Clone repository
-git clone https://github.com/SensorsIot/Serial-via-Ethernet.git
-cd Serial-via-Ethernet/pi
+git clone https://github.com/SensorsIot/USB-Serial-via-Ethernet.git
+cd USB-Serial-via-Ethernet/pi
 
-# Install portal and serial proxy
-sudo cp portal.py /usr/local/bin/rfc2217-portal
-sudo cp serial_proxy.py /usr/local/bin/serial-proxy
-sudo chmod +x /usr/local/bin/rfc2217-portal /usr/local/bin/serial-proxy
+# Run installer
+sudo bash install.sh
+```
 
-# Install hotplug script
-sudo cp scripts/rfc2217-hotplug.sh /usr/local/bin/rfc2217-hotplug
-sudo chmod +x /usr/local/bin/rfc2217-hotplug
+The installer copies:
+- `portal.py` → `/usr/local/bin/rfc2217-portal`
+- `wifi_controller.py` → `/usr/local/bin/wifi_controller.py`
+- `serial_proxy.py` → `/usr/local/bin/serial_proxy.py`
+- `scripts/rfc2217-udev-notify.sh` → `/usr/local/bin/rfc2217-udev-notify.sh`
+- `scripts/wifi-lease-notify.sh` → `/usr/local/bin/wifi-lease-notify.sh`
+- `udev/99-rfc2217-hotplug.rules` → `/etc/udev/rules.d/`
+- `systemd/rfc2217-portal.service` → `/etc/systemd/system/`
+- `config/slots.json` → `/etc/rfc2217/slots.json` (if not already present)
 
-# Install udev rules
-sudo cp udev/99-rfc2217.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
+### Configure Slots
 
-# Create log directory
-sudo mkdir -p /var/log/serial
-sudo chmod 755 /var/log/serial
+Each physical USB hub connector maps to a fixed TCP port. Use the learning tool to discover slot keys:
 
-# Install systemd service
-sudo cp systemd/rfc2217-portal.service /etc/systemd/system/
+```bash
+# Plug a device into the first hub connector, then run:
+rfc2217-learn-slots
 
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable --now rfc2217-portal
+# Output:
+# Detected device:
+#   DEVNAME:  /dev/ttyACM0
+#   ID_PATH:  platform-3f980000.usb-usb-0:1.1:1.0
+#
+# Add this to /etc/rfc2217/slots.json:
+#   {"label": "SLOT1", "slot_key": "platform-3f980000.usb-usb-0:1.1:1.0", "tcp_port": 4001}
+```
+
+Edit `/etc/rfc2217/slots.json`:
+
+```json
+{
+  "slots": [
+    {"label": "SLOT1", "slot_key": "platform-3f980000.usb-usb-0:1.1:1.0", "tcp_port": 4001},
+    {"label": "SLOT2", "slot_key": "platform-3f980000.usb-usb-0:1.3:1.0", "tcp_port": 4002},
+    {"label": "SLOT3", "slot_key": "platform-3f980000.usb-usb-0:1.4:1.0", "tcp_port": 4003}
+  ]
+}
+```
+
+Restart the portal after editing:
+
+```bash
+sudo systemctl restart rfc2217-portal
 ```
 
 ### Verify Installation
@@ -120,160 +134,75 @@ sudo systemctl status rfc2217-portal
 # Check web portal
 curl http://localhost:8080/api/info
 
-# List connected devices
+# List slot status
 curl http://localhost:8080/api/devices
 
 # Check RFC2217 servers
 ss -tlnp | grep 400
 ```
 
-### Connect USB Devices
-
-1. Plug in your ESP32 devices
-2. They should appear automatically:
-
-```bash
-# Check devices detected
-ls -la /dev/ttyUSB* /dev/ttyACM*
-
-# Check RFC2217 servers started
-curl http://localhost:8080/api/discover
-```
-
 ---
 
-## Part 2: Container Setup
+## Part 2: Client Setup
 
 ### No VM Configuration Required
 
-RFC2217 uses standard TCP connections. Containers connect directly to the Pi - no special VM setup needed.
+RFC2217 uses standard TCP connections. Containers and VMs connect directly to the Pi — no special configuration needed.
 
 **Requirements:**
-- Container can reach Pi's IP address
-- Ports 4001+ and 8080 are not blocked
+- Client can reach the Pi's IP address
+- Ports 4001–4003 and 8080 are not blocked
 
-### Install Dependencies in Container
+### Install Dependencies
 
 ```bash
 # Python with pyserial
-apt update && apt install -y python3-pip
 pip3 install pyserial
 
 # Optional: esptool for flashing
 pip3 install esptool
 ```
 
-### Copy Discovery Scripts (Optional)
-
-```bash
-# Copy from repo or download
-curl -O https://raw.githubusercontent.com/SensorsIot/Serial-via-Ethernet/main/container/scripts/discover.py
-curl -O https://raw.githubusercontent.com/SensorsIot/Serial-via-Ethernet/main/container/scripts/monitor.py
-```
-
 ---
 
 ## Part 3: Connecting to Devices
 
-### Method 1: Discovery API
+### Slot API
 
-Query available devices:
+Query slot status:
 
 ```bash
-curl http://PI_IP:8080/api/discover
+curl http://serial1:8080/api/devices
 ```
 
 Response:
+
 ```json
 {
-  "devices": [
+  "slots": [
     {
-      "url": "rfc2217://192.168.1.100:4001",
-      "port": 4001,
-      "product": "CP2102 USB to UART Bridge",
-      "serial": "0001",
-      "tty": "/dev/ttyUSB0"
-    },
-    {
-      "url": "rfc2217://192.168.1.100:4002",
-      "port": 4002,
-      "product": "USB Single Serial",
-      "serial": "58DD029450",
-      "tty": "/dev/ttyUSB1"
+      "label": "SLOT1",
+      "slot_key": "platform-...-usb-0:1.1:1.0",
+      "tcp_port": 4001,
+      "present": true,
+      "running": true,
+      "devnode": "/dev/ttyACM0",
+      "url": "rfc2217://192.168.0.87:4001"
     }
-  ]
+  ],
+  "host_ip": "192.168.0.87",
+  "hostname": "serial1"
 }
 ```
 
-### Method 2: Python Discovery Helper
-
-```python
-from discover import discover_devices, get_device_url, get_serial_connection
-
-# List all available devices
-devices = discover_devices("192.168.1.100")
-for d in devices:
-    print(f"{d['url']} - {d['product']} [{d['serial']}]")
-
-# Get URL by index (0 = first device)
-url = get_device_url("192.168.1.100", index=0)
-print(url)  # rfc2217://192.168.1.100:4001
-
-# Get URL by serial number (stable across reboots)
-url = get_device_url("192.168.1.100", serial="58DD029450")
-
-# Get ready-to-use serial connection
-ser = get_serial_connection("192.168.1.100", index=0)
-while True:
-    line = ser.readline()
-    if line:
-        print(line.decode().strip())
-```
-
-### Method 3: Environment Variables
-
-```bash
-# Set Pi host
-export PI_HOST=192.168.1.100
-
-# Select device by index
-export ESP32_INDEX=0
-
-# Or select by serial number
-export ESP32_SERIAL=58DD029450
-```
-
-Then in Python:
-```python
-from discover import auto_discover
-
-url = auto_discover()  # Uses PI_HOST and ESP32_INDEX/ESP32_SERIAL
-```
-
-### Method 4: Direct URL
-
-If you know the port assignment:
+### Connect from Python
 
 ```python
 import serial
 
-ser = serial.serial_for_url("rfc2217://192.168.1.100:4001", baudrate=115200, timeout=1)
-```
-
----
-
-## Part 4: Usage Examples
-
-### Serial Monitor
-
-```python
-import serial
-import os
-
-PORT = os.environ.get('ESP32_PORT', 'rfc2217://192.168.1.100:4001')
-
-ser = serial.serial_for_url(PORT, baudrate=115200, timeout=1)
-print(f"Connected to {PORT}")
+# Connect to SLOT1
+ser = serial.serial_for_url("rfc2217://serial1:4001", baudrate=115200, timeout=1)
+print(f"Connected")
 
 while True:
     line = ser.readline()
@@ -285,14 +214,14 @@ while True:
 
 ```bash
 # Read chip info
-esptool --port 'rfc2217://192.168.1.100:4001?ign_set_control' chip_id
+esptool --port 'rfc2217://serial1:4001?ign_set_control' chip_id
 
 # Flash firmware
-esptool --port 'rfc2217://192.168.1.100:4001?ign_set_control' \
+esptool --port 'rfc2217://serial1:4001?ign_set_control' \
     write_flash 0x0 firmware.bin
 
 # If timeout errors, use --no-stub
-esptool --no-stub --port 'rfc2217://192.168.1.100:4001?ign_set_control' \
+esptool --no-stub --port 'rfc2217://serial1:4001?ign_set_control' \
     write_flash 0x0 firmware.bin
 ```
 
@@ -305,15 +234,15 @@ platform = espressif32
 board = esp32dev
 framework = arduino
 
-upload_port = rfc2217://192.168.1.100:4001?ign_set_control
-monitor_port = rfc2217://192.168.1.100:4001?ign_set_control
+upload_port = rfc2217://serial1:4001?ign_set_control
+monitor_port = rfc2217://serial1:4001?ign_set_control
 monitor_speed = 115200
 ```
 
 ### ESP-IDF
 
 ```bash
-export ESPPORT='rfc2217://192.168.1.100:4001?ign_set_control'
+export ESPPORT='rfc2217://serial1:4001?ign_set_control'
 idf.py flash monitor
 ```
 
@@ -326,7 +255,7 @@ If your tool requires a local device path:
 apt install -y socat
 
 # Create virtual serial port
-socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:192.168.1.100:4001 &
+socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:serial1:4001 &
 
 # Now use /dev/ttyESP32
 cat /dev/ttyESP32
@@ -334,47 +263,91 @@ cat /dev/ttyESP32
 
 ---
 
-## Part 5: Docker / Docker Compose
+## Part 4: WiFi Tester
 
-### Dockerfile
+The Pi's onboard wlan0 radio doubles as a WiFi test instrument. See the
+[WiFi Tester HTTP Manual](WiFi-Tester-HTTP-Manual.md) for full API details.
 
-```dockerfile
-FROM python:3.11-slim
+### Operating Modes
 
-RUN pip install pyserial esptool
+| Mode | wlan0 | WiFi Tester |
+|------|-------|-------------|
+| WiFi-Testing (default) | Test instrument | Active |
+| Serial Interface | Joins WiFi for LAN | Disabled |
 
-COPY discover.py monitor.py /app/
-WORKDIR /app
-
-CMD ["python", "monitor.py"]
-```
-
-### docker-compose.yml
-
-```yaml
-version: '3.8'
-
-services:
-  esp32-monitor-a:
-    build: .
-    environment:
-      - PI_HOST=192.168.1.100
-      - ESP32_INDEX=0
-    restart: unless-stopped
-
-  esp32-monitor-b:
-    build: .
-    environment:
-      - PI_HOST=192.168.1.100
-      - ESP32_INDEX=1
-    restart: unless-stopped
-```
-
-### Run
+Switch via web UI toggle or API:
 
 ```bash
-docker-compose up -d
-docker-compose logs -f esp32-monitor-a
+# Switch to serial-interface mode (wlan0 joins WiFi)
+curl -X POST http://serial1:8080/api/wifi/mode \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "serial-interface", "ssid": "MyWiFi", "pass": "password"}'
+
+# Switch back to wifi-testing mode
+curl -X POST http://serial1:8080/api/wifi/mode \
+  -H 'Content-Type: application/json' \
+  -d '{"mode": "wifi-testing"}'
+```
+
+### Start a SoftAP
+
+```bash
+curl -X POST http://serial1:8080/api/wifi/ap_start \
+  -H 'Content-Type: application/json' \
+  -d '{"ssid": "TestNetwork", "pass": "password123", "channel": 6}'
+```
+
+The AP runs at `192.168.4.1/24` with DHCP range `.2`–`.20`.
+
+### Scan for Networks
+
+```bash
+curl http://serial1:8080/api/wifi/scan
+```
+
+### Run WiFi Tests
+
+```bash
+cd pytest
+pip install pytest
+
+# Basic tests (no DUT needed)
+pytest test_instrument.py --wt-url http://serial1:8080
+
+# Full tests (requires a WiFi device connected to the AP)
+pytest test_instrument.py --wt-url http://serial1:8080 --run-dut
+```
+
+---
+
+## Part 5: Serial Logging
+
+All serial traffic is logged when using `serial_proxy.py` (the fallback proxy).
+
+### Log Location
+
+Logs are stored on the Pi at `/var/log/serial/`.
+
+### Log Format
+
+```
+[2026-02-03 19:32:00.154] [RX] ESP32 boot message here...
+[2026-02-03 19:32:00.258] [INFO] Baudrate changed to 115200
+[2026-02-03 19:32:00.711] [TX] Data sent to ESP32...
+```
+
+- **[RX]** — Data received from device
+- **[TX]** — Data sent to device
+- **[INFO]** — Protocol events (baudrate changes, connections)
+
+### View Logs
+
+```bash
+# Live tail on Pi
+tail -f /var/log/serial/*.log
+
+# Portal logs
+journalctl -u rfc2217-portal -f
 ```
 
 ---
@@ -389,295 +362,144 @@ sudo systemctl status rfc2217-portal
 sudo journalctl -u rfc2217-portal -f
 ```
 
-**esp_rfc2217_server not found:**
-```bash
-sudo pip3 install --force-reinstall esptool --break-system-packages
-```
-
 **Device not detected:**
 ```bash
 ls -la /dev/ttyUSB* /dev/ttyACM*
-dmesg | grep -i usb | tail -20
+dmesg | tail -20
 ```
 
-**Server not auto-starting:**
-```bash
-sudo udevadm control --reload-rules
-sudo /usr/local/bin/rfc2217-hotplug add /dev/ttyUSB0
-journalctl -t rfc2217-hotplug
-```
+**Hotplug events not reaching portal:**
+
+udev runs scripts in a network-isolated sandbox (`PrivateNetwork=yes`).
+The udev rules use `systemd-run --no-block` to escape this sandbox.
+If you write custom udev rules, wrap your script with `systemd-run`.
 
 **Check listening ports:**
 ```bash
-ss -tlnp | grep 400
+ss -tlnp | grep -E '400|8080'
 ```
 
-### Container Side
+### Client Side
 
 **Connection refused:**
 ```bash
 # Check network connectivity
-ping 192.168.1.100
-curl http://192.168.1.100:8080/api/discover
+ping serial1
+curl http://serial1:8080/api/devices
 ```
 
 **Timeout during flash:**
 - Use `--no-stub` flag with esptool
-- Check network latency: `ping 192.168.1.100`
+- Check network latency: `ping serial1`
 
 **Port busy:**
-- Only one client can connect at a time
-- Close other connections first
+- Only one client can connect per slot at a time
+- Close the other connection first
 
 ### Common Issues
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
-| Connection refused | Server not running | Start via portal or check udev |
-| Timeout | Network latency | Use `--no-stub`, check network |
-| Permission denied | Device permissions | Check user is in `dialout` group |
-| Device not found | USB not detected | Check `dmesg`, try different port |
-| Port busy | Another client connected | Close other connection |
+| Connection refused | Proxy not running | Check portal at :8080; verify device is plugged in |
+| Timeout during flash | Network latency | Use `esptool --no-stub` for reliability |
+| Port busy | Another client connected | Close other connection first |
+| Hotplug not working | udev sandbox | Verify rules use `systemd-run --no-block` |
+| Device not detected | USB issue | Run `dmesg \| tail` on the Pi |
+| Wrong slot after replug | Normal | slot_key ensures same port; devnode may change |
 
 ---
 
-## Part 7: Port Assignments
-
-Ports are assigned automatically starting from 4001:
-
-| Port | Assignment |
-|------|------------|
-| 4001 | First device detected |
-| 4002 | Second device detected |
-| 4003 | Third device detected |
-| ... | ... |
-
-Port assignments are saved in `/etc/rfc2217/devices.conf`:
-
-```
-# RFC2217 device-port assignments
-/dev/ttyUSB0=4001
-/dev/ttyUSB1=4002
-```
-
-### Stable Assignments
-
-For consistent port assignments across reboots, use device serial numbers:
-
-```bash
-# Find serial numbers
-curl http://PI_IP:8080/api/discover | jq '.devices[] | {serial, port}'
-```
-
-Then in containers, reference by serial:
-```python
-url = get_device_url("192.168.1.100", serial="58DD029450")
-```
-
----
-
-## Part 8: Network Requirements
+## Part 7: Network Requirements
 
 | Port | Direction | Purpose |
 |------|-----------|---------|
-| 8080 | Browser/Container → Pi | Web portal, Discovery API |
-| 4001+ | Container → Pi | RFC2217 serial data |
+| 8080 | Client → Pi | Web portal and REST API |
+| 4001–4003 | Client → Pi | RFC2217 serial connections |
+| 192.168.4.x | WiFi devices → Pi | WiFi AP subnet (when AP active) |
 
 ### Firewall Rules (if needed)
 
-**On Pi:**
 ```bash
+# On Pi
 sudo ufw allow 8080/tcp
-sudo ufw allow 4001:4010/tcp
-```
-
-**On VM (usually not needed):**
-```bash
-sudo ufw allow out to PI_IP port 4001:4010 proto tcp
-sudo ufw allow out to PI_IP port 8080 proto tcp
+sudo ufw allow 4001:4003/tcp
 ```
 
 ---
 
-## Part 9: Security Considerations
+## Part 8: Security Considerations
 
-- RFC2217 has **no authentication** - anyone who can reach the port can connect
-- Keep on trusted network or use VPN/firewall
+- RFC2217 has **no authentication** — anyone who can reach the port can connect
+- Keep on a trusted network or use VPN/firewall
 - Portal runs as root for device access
 - Consider SSH tunnel for remote access:
 
 ```bash
 # On client, create tunnel
-ssh -L 4001:localhost:4001 -L 8080:localhost:8080 pi@PI_IP
+ssh -L 4001:localhost:4001 -L 8080:localhost:8080 pi@serial1
 
 # Then connect to localhost
-curl http://localhost:8080/api/discover
+curl http://localhost:8080/api/devices
 ```
 
 ---
 
-## Part 10: Files Reference
+## Part 9: Files Reference
 
 ### Pi Files
 
 | Path | Purpose |
 |------|---------|
-| `/usr/local/bin/rfc2217-portal` | Web portal + discovery API |
-| `/usr/local/bin/rfc2217-hotplug` | udev hotplug handler |
-| `/etc/systemd/system/rfc2217-portal.service` | Systemd service |
-| `/etc/udev/rules.d/99-rfc2217.rules` | Auto-start on device plug |
-| `/etc/rfc2217/devices.conf` | Port assignments |
+| `/usr/local/bin/rfc2217-portal` | Portal: web UI, API, proxy supervisor, WiFi API |
+| `/usr/local/bin/wifi_controller.py` | WiFi instrument backend |
+| `/usr/local/bin/esp_rfc2217_server.py` | RFC2217 server from esptool (preferred) |
+| `/usr/local/bin/serial_proxy.py` | RFC2217 proxy with logging (fallback) |
+| `/usr/local/bin/rfc2217-udev-notify.sh` | udev event forwarder |
+| `/usr/local/bin/wifi-lease-notify.sh` | dnsmasq DHCP lease forwarder |
+| `/usr/local/bin/rfc2217-learn-slots` | Slot discovery tool |
+| `/etc/rfc2217/slots.json` | Slot configuration |
+| `/etc/udev/rules.d/99-rfc2217-hotplug.rules` | udev rules |
+| `/etc/systemd/system/rfc2217-portal.service` | systemd unit |
+| `/var/log/serial/` | Serial traffic logs |
 
-### Container Files
+### Key Concepts
 
-| Path | Purpose |
-|------|---------|
-| `discover.py` | Device discovery helper |
-| `monitor.py` | Example serial monitor |
-
----
-
----
-
-## Part 8: Serial Logging
-
-All serial traffic is automatically logged with timestamps.
-
-### Log Location
-
-Logs are stored on the Pi at `/var/log/serial/`:
-
-```bash
-ls -la /var/log/serial/
-# FT232R_USB_UART_A5069RR4_2026-02-03.log
-# CP2102_USB_to_UART_0001_2026-02-03.log
-```
-
-### Log Format
-
-```
-[2026-02-03 19:32:00.154] [RX] ESP32 boot message here...
-[2026-02-03 19:32:00.258] [INFO] Baudrate changed to 115200
-[2026-02-03 19:32:00.711] [TX] Data sent to ESP32...
-[2026-02-03 19:32:00.826] [INFO] Client connected from 192.168.1.50:54321
-```
-
-- **[RX]** - Data received from ESP32
-- **[TX]** - Data sent to ESP32
-- **[INFO]** - Protocol events (baudrate changes, connections, etc.)
-
-### View Logs
-
-**On Pi:**
-```bash
-# Live tail
-tail -f /var/log/serial/*.log
-
-# Search for errors
-grep -i "error\|panic\|guru" /var/log/serial/*.log
-```
-
-**Via API:**
-```bash
-# List available logs
-curl http://PI_IP:8080/api/logs
-
-# Get last 100 lines of specific log
-curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=100"
-
-# Get last 500 lines
-curl "http://PI_IP:8080/api/logs/FT232R_USB_UART_A5069RR4_2026-02-03.log?lines=500"
-```
-
-### Log Rotation
-
-Logs rotate daily (new file per day). Old logs are not automatically deleted - manage manually or set up logrotate:
-
-```bash
-# /etc/logrotate.d/serial-proxy
-/var/log/serial/*.log {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-}
-```
-
-### Use Cases
-
-1. **AI Monitoring** - Parse logs for crash detection, memory warnings, WiFi issues
-2. **Debugging** - Review exact sequence of events leading to a problem
-3. **Audit Trail** - Record all commands sent to devices
-4. **Performance Analysis** - Analyze timing and response patterns
-
----
-
-## Part 9: Flashing Without DTR/RTS
-
-If your USB-serial adapter doesn't have DTR/RTS connected to the ESP32's EN/BOOT pins, you'll need to manually enter bootloader mode.
-
-### Manual Bootloader Entry
-
-1. Press and hold the **BOOT** button on the ESP32
-2. Press and release the **RESET** button
-3. Release the **BOOT** button
-4. Run the flash command within 2-3 seconds:
-
-```bash
-esptool --port 'rfc2217://PI_IP:4001' write_flash 0x0 firmware.bin
-```
-
-### Monitoring Works Normally
-
-Serial monitoring works regardless of DTR/RTS:
-
-```python
-import serial
-ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
-while True:
-    line = ser.readline()
-    if line:
-        print(line.decode().strip())
-```
+- **Slot** — a physical USB hub connector, identified by `slot_key` (udev `ID_PATH`)
+- **Same connector = same TCP port**, regardless of device or devnode name
+- **Two modes** — WiFi-Testing (default, wlan0 = instrument) and Serial Interface (wlan0 = LAN)
 
 ---
 
 ## Quick Reference
 
-**Start/Stop servers:**
+**Check status:**
 ```bash
-# Via portal
-curl -X POST http://PI_IP:8080/api/start-all
-curl -X POST http://PI_IP:8080/api/stop-all
-
-# Manual
-serial-proxy -p 4001 -l /var/log/serial /dev/ttyUSB0
-pkill -f serial-proxy
-```
-
-**Discover devices:**
-```bash
-curl http://PI_IP:8080/api/discover
-```
-
-**View logs:**
-```bash
-curl http://PI_IP:8080/api/logs
-curl "http://PI_IP:8080/api/logs/DEVICE_DATE.log?lines=100"
+curl http://serial1:8080/api/devices
+curl http://serial1:8080/api/info
 ```
 
 **Connect from Python:**
 ```python
 import serial
-ser = serial.serial_for_url("rfc2217://PI_IP:4001", baudrate=115200)
+ser = serial.serial_for_url("rfc2217://serial1:4001", baudrate=115200)
 ```
 
 **Flash with esptool:**
 ```bash
-# With DTR/RTS auto-reset
-esptool --port 'rfc2217://PI_IP:4001?ign_set_control' write_flash 0x0 fw.bin
-
-# Without DTR/RTS (manual BOOT+RESET first)
-esptool --port 'rfc2217://PI_IP:4001' write_flash 0x0 fw.bin
+esptool --port 'rfc2217://serial1:4001?ign_set_control' write_flash 0x0 fw.bin
 ```
+
+**WiFi tester:**
+```bash
+# Start AP
+curl -X POST http://serial1:8080/api/wifi/ap_start \
+  -H 'Content-Type: application/json' -d '{"ssid":"Test","pass":"pass1234"}'
+
+# Scan
+curl http://serial1:8080/api/wifi/scan
+
+# Check mode
+curl http://serial1:8080/api/wifi/mode
+```
+
+**Web portal:** Open `http://serial1:8080` in a browser.
