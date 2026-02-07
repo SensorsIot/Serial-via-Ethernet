@@ -172,7 +172,7 @@ pip3 install esptool
 Query slot status:
 
 ```bash
-curl http://serial1:8080/api/devices
+curl http://192.168.0.87:8080/api/devices
 ```
 
 Response:
@@ -191,7 +191,7 @@ Response:
     }
   ],
   "host_ip": "192.168.0.87",
-  "hostname": "serial1"
+  "hostname": "192.168.0.87"
 }
 ```
 
@@ -201,7 +201,7 @@ Response:
 import serial
 
 # Connect to SLOT1
-ser = serial.serial_for_url("rfc2217://serial1:4001", baudrate=115200, timeout=1)
+ser = serial.serial_for_url("rfc2217://192.168.0.87:4001", baudrate=115200, timeout=1)
 print(f"Connected")
 
 while True:
@@ -214,14 +214,14 @@ while True:
 
 ```bash
 # Read chip info
-esptool --port 'rfc2217://serial1:4001?ign_set_control' chip_id
+esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' chip_id
 
 # Flash firmware
-esptool --port 'rfc2217://serial1:4001?ign_set_control' \
+esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' \
     write_flash 0x0 firmware.bin
 
 # If timeout errors, use --no-stub
-esptool --no-stub --port 'rfc2217://serial1:4001?ign_set_control' \
+esptool --no-stub --port 'rfc2217://192.168.0.87:4001?ign_set_control' \
     write_flash 0x0 firmware.bin
 ```
 
@@ -234,15 +234,15 @@ platform = espressif32
 board = esp32dev
 framework = arduino
 
-upload_port = rfc2217://serial1:4001?ign_set_control
-monitor_port = rfc2217://serial1:4001?ign_set_control
+upload_port = rfc2217://192.168.0.87:4001?ign_set_control
+monitor_port = rfc2217://192.168.0.87:4001?ign_set_control
 monitor_speed = 115200
 ```
 
 ### ESP-IDF
 
 ```bash
-export ESPPORT='rfc2217://serial1:4001?ign_set_control'
+export ESPPORT='rfc2217://192.168.0.87:4001?ign_set_control'
 idf.py flash monitor
 ```
 
@@ -255,7 +255,7 @@ If your tool requires a local device path:
 apt install -y socat
 
 # Create virtual serial port
-socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:serial1:4001 &
+socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:192.168.0.87:4001 &
 
 # Now use /dev/ttyESP32
 cat /dev/ttyESP32
@@ -279,12 +279,12 @@ Switch via web UI toggle or API:
 
 ```bash
 # Switch to serial-interface mode (wlan0 joins WiFi)
-curl -X POST http://serial1:8080/api/wifi/mode \
+curl -X POST http://192.168.0.87:8080/api/wifi/mode \
   -H 'Content-Type: application/json' \
   -d '{"mode": "serial-interface", "ssid": "MyWiFi", "pass": "password"}'
 
 # Switch back to wifi-testing mode
-curl -X POST http://serial1:8080/api/wifi/mode \
+curl -X POST http://192.168.0.87:8080/api/wifi/mode \
   -H 'Content-Type: application/json' \
   -d '{"mode": "wifi-testing"}'
 ```
@@ -292,7 +292,7 @@ curl -X POST http://serial1:8080/api/wifi/mode \
 ### Start a SoftAP
 
 ```bash
-curl -X POST http://serial1:8080/api/wifi/ap_start \
+curl -X POST http://192.168.0.87:8080/api/wifi/ap_start \
   -H 'Content-Type: application/json' \
   -d '{"ssid": "TestNetwork", "pass": "password123", "channel": 6}'
 ```
@@ -302,7 +302,7 @@ The AP runs at `192.168.4.1/24` with DHCP range `.2`–`.20`.
 ### Scan for Networks
 
 ```bash
-curl http://serial1:8080/api/wifi/scan
+curl http://192.168.0.87:8080/api/wifi/scan
 ```
 
 ### Run WiFi Tests
@@ -312,10 +312,10 @@ cd pytest
 pip install pytest
 
 # Basic tests (no DUT needed)
-pytest test_instrument.py --wt-url http://serial1:8080
+pytest test_instrument.py --wt-url http://192.168.0.87:8080
 
 # Full tests (requires a WiFi device connected to the AP)
-pytest test_instrument.py --wt-url http://serial1:8080 --run-dut
+pytest test_instrument.py --wt-url http://192.168.0.87:8080 --run-dut
 ```
 
 ---
@@ -384,13 +384,13 @@ ss -tlnp | grep -E '400|8080'
 **Connection refused:**
 ```bash
 # Check network connectivity
-ping serial1
-curl http://serial1:8080/api/devices
+ping 192.168.0.87
+curl http://192.168.0.87:8080/api/devices
 ```
 
 **Timeout during flash:**
 - Use `--no-stub` flag with esptool
-- Check network latency: `ping serial1`
+- Check network latency: `ping 192.168.0.87`
 
 **Port busy:**
 - Only one client can connect per slot at a time
@@ -436,7 +436,7 @@ sudo ufw allow 4001:4003/tcp
 
 ```bash
 # On client, create tunnel
-ssh -L 4001:localhost:4001 -L 8080:localhost:8080 pi@serial1
+ssh -L 4001:localhost:4001 -L 8080:localhost:8080 pi@192.168.0.87
 
 # Then connect to localhost
 curl http://localhost:8080/api/devices
@@ -474,32 +474,32 @@ curl http://localhost:8080/api/devices
 
 **Check status:**
 ```bash
-curl http://serial1:8080/api/devices
-curl http://serial1:8080/api/info
+curl http://192.168.0.87:8080/api/devices
+curl http://192.168.0.87:8080/api/info
 ```
 
 **Connect from Python:**
 ```python
 import serial
-ser = serial.serial_for_url("rfc2217://serial1:4001", baudrate=115200)
+ser = serial.serial_for_url("rfc2217://192.168.0.87:4001", baudrate=115200)
 ```
 
 **Flash with esptool:**
 ```bash
-esptool --port 'rfc2217://serial1:4001?ign_set_control' write_flash 0x0 fw.bin
+esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' write_flash 0x0 fw.bin
 ```
 
 **WiFi tester:**
 ```bash
 # Start AP
-curl -X POST http://serial1:8080/api/wifi/ap_start \
+curl -X POST http://192.168.0.87:8080/api/wifi/ap_start \
   -H 'Content-Type: application/json' -d '{"ssid":"Test","pass":"pass1234"}'
 
 # Scan
-curl http://serial1:8080/api/wifi/scan
+curl http://192.168.0.87:8080/api/wifi/scan
 
 # Check mode
-curl http://serial1:8080/api/wifi/mode
+curl http://192.168.0.87:8080/api/wifi/mode
 ```
 
-**Web portal:** Open `http://serial1:8080` in a browser.
+**Web portal:** Open `http://192.168.0.87:8080` in a browser.

@@ -187,7 +187,7 @@ Configuration file: `/etc/rfc2217/slots.json`
     }
   ],
   "host_ip": "192.168.0.87",
-  "hostname": "serial1"
+  "hostname": "192.168.0.87"
 }
 ```
 
