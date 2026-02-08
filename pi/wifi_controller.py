@@ -442,35 +442,44 @@ def sta_join(ssid, password="", timeout=15, _internal=False):
             _sta_stop_unlocked()
             raise RuntimeError(f"Failed to connect to '{ssid}' within {timeout}s")
 
-        # Get IP via DHCP
+        # Get IP via DHCP — try dhcpcd (Debian/Bookworm), dhclient, udhcpc
+        # dhcpcd on Bookworm runs as a system daemon; -1 sends a control
+        # command that returns immediately while the daemon does DHCP in the
+        # background (including ARP probing which takes ~3s).
         try:
-            _run(["dhclient", "-1", "-v", WLAN_IF], timeout=timeout, check=False)
+            _run(["/usr/sbin/dhcpcd", "-1", "-4", WLAN_IF], timeout=timeout, check=False)
         except Exception:
-            # Try udhcpc as fallback
             try:
-                _run(["udhcpc", "-i", WLAN_IF, "-n", "-q"], timeout=timeout, check=False)
+                _run(["dhclient", "-1", "-v", WLAN_IF], timeout=timeout, check=False)
+            except Exception:
+                try:
+                    _run(["udhcpc", "-i", WLAN_IF, "-n", "-q"], timeout=timeout, check=False)
+                except Exception:
+                    pass
+
+        # Poll for IPv4 address (dhcpcd ARP probing takes ~3s)
+        ip_addr = ""
+        gateway = ""
+        deadline = time.monotonic() + min(timeout, 15)
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            try:
+                out = _run(["ip", "-4", "addr", "show", WLAN_IF])
+                m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+                if m:
+                    ip_addr = m.group(1)
+                    break
             except Exception:
                 pass
 
-        # Read assigned IP
-        time.sleep(1)
-        ip_addr = ""
-        gateway = ""
-        try:
-            out = _run(["ip", "-4", "addr", "show", WLAN_IF])
-            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-            if m:
-                ip_addr = m.group(1)
-        except Exception:
-            pass
-
-        try:
-            out = _run(["ip", "route", "show", "dev", WLAN_IF])
-            m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
-            if m:
-                gateway = m.group(1)
-        except Exception:
-            pass
+        if ip_addr:
+            try:
+                out = _run(["ip", "route", "show", "dev", WLAN_IF])
+                m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
+                if m:
+                    gateway = m.group(1)
+            except Exception:
+                pass
 
         if not ip_addr:
             _sta_stop_unlocked()
@@ -513,14 +522,20 @@ def _sta_stop_unlocked():
     except Exception:
         pass
 
-    # Release DHCP
+    # Release DHCP — try dhcpcd (Debian/Bookworm), dhclient
     try:
         subprocess.run(
-            ["dhclient", "-r", WLAN_IF],
+            ["/usr/sbin/dhcpcd", "--release", WLAN_IF],
             capture_output=True, timeout=5, check=False,
         )
     except Exception:
-        pass
+        try:
+            subprocess.run(
+                ["dhclient", "-r", WLAN_IF],
+                capture_output=True, timeout=5, check=False,
+            )
+        except Exception:
+            pass
 
     _flush_addr()
     _sta_active = False
