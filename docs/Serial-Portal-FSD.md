@@ -91,6 +91,59 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 | conftest.py | pytest/ | Pytest fixtures and CLI options |
 | test_instrument.py | pytest/ | WiFi tester self-tests (WT-xxx) |
 
+### 1.6 State Model
+
+The system provides two independent services — Serial and WiFi — each with
+its own state machine.  Serial operates per slot; WiFi operates on wlan0.
+
+**Serial Service (per slot):**
+
+| State | Description |
+|-------|-------------|
+| Absent | No USB device in this slot |
+| Idle | Device present, proxy running, no active operation |
+| Flashing | External tool (esptool) using RFC2217 proxy — reset/monitor blocked |
+| Resetting | DTR/RTS reset in progress — proxy stopped, direct serial in use |
+| Monitoring | Reading serial output for pattern matching |
+| Flapping | USB connect/disconnect cycling detected — needs recovery |
+
+State transitions:
+
+| From | To | Trigger |
+|------|----|---------|
+| Absent | Idle | Hotplug add + proxy start |
+| Idle | Absent | Hotplug remove |
+| Idle | Flashing | External RFC2217 client connects (esptool) |
+| Flashing | Idle | Client disconnects, proxy restarts via hotplug |
+| Idle | Resetting | `POST /api/serial/reset` — stops proxy, opens direct serial, sends DTR/RTS |
+| Resetting | Idle | Reset complete, proxy restarts via hotplug |
+| Idle | Monitoring | `POST /api/serial/monitor` — reads serial via RFC2217 (non-exclusive) |
+| Monitoring | Idle | Pattern matched or timeout expired |
+| Idle | Flapping | 6+ hotplug events in 30s |
+| Flapping | Idle | Recovery reset succeeds or cooldown expires |
+
+**WiFi Service (wlan0):**
+
+| State | Description |
+|-------|-------------|
+| Idle | wlan0 not in use for testing |
+| Captive | wlan0 joined DUT's portal AP as STA (Pi at 192.168.4.x, DUT at 192.168.4.1) |
+| AP | wlan0 running test AP (Pi at 192.168.4.1, DUT connects at 192.168.4.x) |
+
+State transitions:
+
+| From | To | Trigger |
+|------|----|---------|
+| Idle | Captive | `POST /api/wifi/sta_join` to DUT's captive portal AP |
+| Captive | Idle | `POST /api/wifi/sta_leave` |
+| Idle | AP | `POST /api/wifi/ap_start` |
+| Captive | AP | `POST /api/wifi/ap_start` (stops STA, starts AP) |
+| AP | Idle | `POST /api/wifi/ap_stop` |
+| AP | Captive | `POST /api/wifi/sta_join` (stops AP, joins network) |
+
+**Note:** Serial-interface mode (wlan0 for LAN) is a separate operating mode
+that disables the WiFi test service entirely (see §1.4).
+
 ---
 
 ## 2. Definitions
@@ -175,6 +228,8 @@ Configuration file: `/etc/rfc2217/slots.json`
 | POST | /api/start | Manually start proxy for a slot |
 | POST | /api/stop | Manually stop proxy for a slot |
 | GET | /api/info | Pi IP, hostname, slot counts |
+| POST | /api/serial/reset | Reset device via DTR/RTS (FR-008) |
+| POST | /api/serial/monitor | Read serial output with pattern match (FR-009) |
 
 **GET /api/devices** returns:
 
@@ -386,6 +441,72 @@ ser.open()
 **Never** use `serial.Serial('rfc2217://...')` directly — it opens the port
 immediately and the RFC2217 negotiation may toggle DTR/RTS.
 
+### FR-008 — Serial Reset
+
+Reset a device via DTR/RTS signals, providing a clean boot cycle without
+requiring SSH access to the Pi.
+
+**Endpoint:** `POST /api/serial/reset`
+
+**Request body:**
+```json
+{"slot": "SLOT2"}
+```
+
+**Procedure:**
+1. Stop the RFC2217 proxy for the slot
+2. Open direct serial (`/dev/ttyACMx`) with `dtr=False, rts=False`
+3. Send DTR/RTS reset pulse: DTR=1, RTS=1 for 50ms, then release both
+4. Wait for device to boot — read serial until first output line or 5s timeout
+5. Close serial connection
+6. Wait `NATIVE_USB_BOOT_DELAY_S` (2s), then restart the proxy (DTR/RTS reset
+   does not cause USB re-enumeration, so hotplug won't restart it automatically)
+
+**Response:**
+```json
+{"ok": true, "output": ["ESP-ROM:esp32c3-api1-20210207", "Boot count: 1"]}
+```
+
+**Error:** Returns `{"ok": false, "error": "..."}` if slot not found, device
+not present, or serial open fails.
+
+**Used by:** enter-portal (§4), flapping recovery (FR-007), integration tests
+
+### FR-009 — Serial Monitor
+
+Read serial output from a device, optionally waiting for a pattern match.
+Uses the RFC2217 proxy (non-exclusive) so the proxy stays running.
+
+**Endpoint:** `POST /api/serial/monitor`
+
+**Request body:**
+```json
+{"slot": "SLOT2", "pattern": "Boot count", "timeout": 10}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| slot | string | Yes | — | Slot label (e.g. "SLOT2") |
+| pattern | string | No | null | Substring to match in serial output |
+| timeout | number | No | 10 | Max seconds to wait |
+
+**Procedure:**
+1. Connect to the slot's RFC2217 proxy (non-exclusive read)
+2. Read serial lines until pattern is matched or timeout expires
+3. Return all captured output and match result
+
+**Response (pattern matched):**
+```json
+{"ok": true, "matched": true, "line": "Boot count: 1", "output": ["ESP-ROM:...", "Boot count: 1"]}
+```
+
+**Response (timeout, no pattern):**
+```json
+{"ok": true, "matched": false, "line": null, "output": ["line1", "line2"]}
+```
+
+**Used by:** enter-portal (§4), flapping recovery (FR-007), test verification
+
 ### FR-007 — USB Flap Detection
 
 When a device enters a boot loop (crash → reboot → crash every ~2-3s), the
@@ -414,9 +535,22 @@ While `flapping=true`:
 
 #### 7.3 Recovery
 
-On each new hotplug event, if the gap since the previous event exceeds
-`FLAP_COOLDOWN_S`, the flapping flag is cleared and normal proxy startup
-resumes.
+When flapping is detected, the portal attempts active recovery using
+serial reset (FR-008) and serial monitor (FR-009):
+
+1. Wait for device to be present (next hotplug `add` event)
+2. Call serial reset (`POST /api/serial/reset`) — stops proxy, sends
+   DTR/RTS pulse, reads initial boot output
+3. Call serial monitor (`POST /api/serial/monitor`) — watch for normal
+   boot indicators (e.g. application startup message)
+4. If device boots normally → clear flapping flag, proxy restarts via
+   hotplug re-enumeration
+5. If boot loop continues (device disconnects again within cooldown) →
+   re-enter flapping state, log error
+
+**Fallback:** If no hotplug event arrives within `FLAP_COOLDOWN_S` (30s),
+the flapping flag is cleared passively and normal proxy startup resumes
+on the next hotplug add.
 
 #### 7.4 Web UI
 
@@ -428,31 +562,71 @@ Other slots are unaffected and continue operating normally.
 
 ---
 
-## 4. WiFi Tester
+## 4. WiFi Service
 
-### FR-010 — WiFi API
+### FR-010 — API Summary
 
-All WiFi endpoints are prefixed `/api/wifi/`.  Tester endpoints (all except
-`/api/wifi/mode` and `/api/wifi/ping`) return `{"ok": false, "error": "WiFi
-testing disabled (Serial Interface mode)"}` when the system is in
+Complete API for both Serial and WiFi services.  WiFi tester endpoints (all
+except `/api/wifi/mode` and `/api/wifi/ping`) return `{"ok": false, "error":
+"WiFi testing disabled (Serial Interface mode)"}` when the system is in
 serial-interface mode.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| **Serial** | | |
+| GET | /api/devices | List all slots with status |
+| POST | /api/hotplug | Receive udev hotplug event (add/remove) |
+| POST | /api/start | Manually start proxy for a slot |
+| POST | /api/stop | Manually stop proxy for a slot |
+| GET | /api/info | Pi IP, hostname, slot counts |
+| POST | /api/serial/reset | Reset device via DTR/RTS (FR-008) |
+| POST | /api/serial/monitor | Read serial output with pattern match (FR-009) |
+| **WiFi** | | |
 | GET | /api/wifi/ping | Version and uptime |
 | GET | /api/wifi/mode | Current operating mode |
 | POST | /api/wifi/mode | Switch operating mode |
-| POST | /api/wifi/ap_start | Start SoftAP |
-| POST | /api/wifi/ap_stop | Stop SoftAP |
+| POST | /api/wifi/ap_start | Start SoftAP (WiFi state → AP) |
+| POST | /api/wifi/ap_stop | Stop SoftAP (WiFi state → Idle) |
 | GET | /api/wifi/ap_status | AP status, SSID, channel, stations |
-| POST | /api/wifi/sta_join | Join WiFi network as station |
-| POST | /api/wifi/sta_leave | Disconnect from WiFi network |
+| POST | /api/wifi/sta_join | Join WiFi network as station (WiFi state → Captive) |
+| POST | /api/wifi/sta_leave | Disconnect from WiFi network (WiFi state → Idle) |
 | GET | /api/wifi/scan | Scan for WiFi networks |
 | POST | /api/wifi/http | HTTP relay through Pi's radio |
 | GET | /api/wifi/events | Event queue (long-poll supported) |
 | POST | /api/wifi/lease_event | Receive dnsmasq lease callback |
+| **Composite** | | |
+| GET | /api/log | Activity log (timestamped entries, filterable with `?since=`) |
+| POST | /api/enter-portal | Trigger DUT captive portal via serial reset/monitor sequence |
 
-### FR-011 — SoftAP Management
+#### Enter-Portal Composite Operation
+
+`POST /api/enter-portal` is a composite operation built on serial reset
+(FR-008) and serial monitor (FR-009).  It forces a DUT into captive portal
+mode by performing rapid reboots until the boot counter exceeds the portal
+threshold.
+
+**Request body:**
+```json
+{"slot": "SLOT2"}
+```
+
+**Procedure (runs in background thread):**
+1. `serial.reset(slot)` — clean boot the device
+2. `serial.monitor(slot, "Boot count reset to 0")` — confirm NVS was reset
+   or normal boot
+3. Loop N times (N = portal threshold, typically 3):
+   a. `serial.reset(slot)` — reboot
+   b. `serial.monitor(slot, "Boot count:")` — confirm boot count incremented
+4. `serial.monitor(slot, "PORTAL mode")` — confirm device entered captive
+   portal mode
+
+Each step is logged to the activity log.  Progress is observable via
+`GET /api/log?since=<ts>`.
+
+**Response:** `{"ok": true}` (operation runs asynchronously; monitor log for
+progress)
+
+### FR-011 — AP Mode
 
 The Pi's wlan0 runs hostapd + dnsmasq to create a SoftAP:
 
@@ -467,14 +641,18 @@ The Pi's wlan0 runs hostapd + dnsmasq to create a SoftAP:
 - Starting AP while AP is already running restarts with new configuration
 - AP and STA are mutually exclusive — starting one stops the other
 
-### FR-012 — STA Mode
+### FR-012 — Captive Mode (STA)
 
-Join an external WiFi network using wpa_supplicant + DHCP:
+Join an external WiFi network (typically a DUT's captive portal AP) using
+wpa_supplicant + DHCP:
 
 - `POST /api/wifi/sta_join` with `{ssid, pass, timeout}`
-- Portal writes wpa_supplicant.conf, starts wpa_supplicant, polls
-  `wpa_cli status` until `wpa_state=COMPLETED`, then obtains IP via
-  `dhclient` (or `udhcpc` fallback)
+- Portal writes wpa_supplicant.conf (with `ctrl_interface=` prepended for
+  `wpa_cli` compatibility), starts wpa_supplicant, polls `wpa_cli status`
+  until `wpa_state=COMPLETED`, then obtains IP via `dhcpcd -1 -4` (or
+  `dhclient`/`udhcpc` fallback)
+- Stale wpa_supplicant control sockets (`/var/run/wpa_supplicant/wlan0`) are
+  cleaned up before each start to prevent "ctrl_iface exists" errors
 - Returns `{ip, gateway}` on success; raises error on timeout or no IP
 - `POST /api/wifi/sta_leave` disconnects and releases DHCP
 - STA and AP are mutually exclusive — starting STA stops the AP
@@ -530,8 +708,15 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
   AP status (SSID, channel, station count), and mode-specific information
 - **Mode toggle** — clicking "Serial Interface" prompts for SSID/password;
   clicking "WiFi-Testing" switches back immediately
+- **Activity Log** — scrollable log panel showing timestamped entries for
+  hotplug events, WiFi tester operations (sta_join, sta_leave, scan, HTTP
+  relay), and enter-portal sequence steps.  Entries are categorised (info,
+  ok, error, step) with colour coding.  "Enter Captive Portal" button
+  triggers `POST /api/enter-portal` to run rapid-reset sequence on a
+  selected slot.  "Clear" button resets the display.  Log is polled every
+  2 seconds via `GET /api/log?since=<last_ts>`.
 - **Auto-refresh** — every 2 seconds via `setInterval`, fetches
-  `/api/devices`, `/api/wifi/mode`, and `/api/wifi/ap_status`
+  `/api/devices`, `/api/wifi/mode`, `/api/wifi/ap_status`, and `/api/log`
 - **Title** — shows `{hostname} — Serial Portal` when hostname is available
 
 ---
@@ -659,7 +844,9 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 4.0 | 2026-02-07 | Claude | WiFi Tester integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
 | 5.0 | 2026-02-07 | Claude | ESP32-C3 native USB support: FR-006 (ttyACM handling, plain RFC2217 server, controlled boot sequence, USB reset types, flashing via SSH), FR-007 (USB flap detection), updated edge cases and device settle checks |
 | 5.1 | 2026-02-08 | Claude | plain_rfc2217_server for ALL devices (ttyACM and ttyUSB); esp_rfc2217_server deprecated; flashing via RFC2217 works for both chip types (no SSH needed); updated proxy selection, flashing docs, deliverables |
+| 5.3 | 2026-02-08 | Claude | Activity log system (`GET /api/log`, `POST /api/enter-portal` for captive portal trigger via rapid resets); WiFi tester fixes (stale wpa_supplicant socket cleanup, `ctrl_interface=` in wpa_passphrase output, `dhcpcd` DHCP client support); activity logging for hotplug events and WiFi tester operations; activity log UI panel with colour-coded entries |
 | 5.2 | 2026-02-08 | Claude | Removed esp_rfc2217_server.py and serial_proxy.py (no longer installed); proxy auto-restart after esptool USB re-enumeration (background stop_proxy, BrokenPipeError fix, curl timeout 10s); FR-004 logging removed; updated deliverables |
+| 6.0 | 2026-02-08 | Claude | Service separation — Serial and WiFi as independent services with state models (§1.6); serial reset (FR-008) and serial monitor (FR-009) as first-class API operations; flapping recovery via active reset; WiFi section renamed to WiFi Service with states Idle/Captive/AP; enter-portal rewritten as composite serial operation; consolidated API table (FR-010) |
 
 ---
 
@@ -899,6 +1086,12 @@ Add this to /etc/rfc2217/slots.json:
 - [ ] TASK-011: Test all test cases
 - [ ] TASK-012: Deploy to Serial Pi (192.168.0.87)
 
+**Serial Services (v6.0):**
+- [ ] TASK-050: Implement `POST /api/serial/reset` (FR-008)
+- [ ] TASK-051: Implement `POST /api/serial/monitor` (FR-009)
+- [ ] TASK-052: Rewrite enter-portal as composite serial operation
+- [ ] TASK-053: Update flapping recovery to use serial reset (FR-007.3)
+
 **Native USB (ESP32-C3):**
 - [x] TASK-030: Create plain_rfc2217_server.py for ttyACM devices
 - [x] TASK-031: Auto-detect ttyACM vs ttyUSB and select proxy server
@@ -916,6 +1109,11 @@ Add this to /etc/rfc2217/slots.json:
 - [x] TASK-024: Create wifi_tester_driver.py (HTTP test driver)
 - [x] TASK-025: Create conftest.py + test_instrument.py (WT-xxx tests)
 - [x] TASK-026: Add WiFi section to web UI with mode toggle
+- [x] TASK-027: Activity log system (deque, `log_activity()`, `GET /api/log`)
+- [x] TASK-028: Enter-portal endpoint (`POST /api/enter-portal`, rapid-reset via serial)
+- [x] TASK-029: Activity log UI panel with enter-portal button
+- [x] TASK-040: WiFi Tester stale wpa_supplicant socket cleanup
+- [x] TASK-041: wpa_passphrase ctrl_interface fix for wpa_cli compatibility
 
 ### C.2 Deliverables
 

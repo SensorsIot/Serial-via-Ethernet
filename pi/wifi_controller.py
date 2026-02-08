@@ -190,6 +190,14 @@ def _release_wlan():
         )
     except Exception:
         pass
+    # Remove stale control interface socket (prevents "ctrl_iface exists" error)
+    ctrl_path = f"/var/run/wpa_supplicant/{WLAN_IF}"
+    try:
+        os.remove(ctrl_path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.warning("Could not remove %s", ctrl_path)
     # Bring interface down then up to reset state
     try:
         _run(["ip", "link", "set", WLAN_IF, "down"], check=False)
@@ -378,7 +386,8 @@ def sta_join(ssid, password="", timeout=15, _internal=False):
             # Use wpa_passphrase for proper encoding
             try:
                 out = _run(["wpa_passphrase", ssid, password])
-                wpa_conf_content = out
+                # wpa_passphrase output lacks ctrl_interface — prepend it
+                wpa_conf_content = 'ctrl_interface=/var/run/wpa_supplicant\n' + out
             except Exception:
                 # Fallback to plain text config
                 wpa_conf_content = (
@@ -492,6 +501,15 @@ def _sta_stop_unlocked():
             ["pkill", "-f", f"wpa_supplicant.*{WLAN_IF}"],
             capture_output=True, timeout=5, check=False,
         )
+    except Exception:
+        pass
+
+    # Remove stale control interface socket
+    ctrl_path = f"/var/run/wpa_supplicant/{WLAN_IF}"
+    try:
+        os.remove(ctrl_path)
+    except FileNotFoundError:
+        pass
     except Exception:
         pass
 

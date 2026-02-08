@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RFC2217 Portal v3 — Proxy Supervisor
+RFC2217 Portal v4 — Proxy Supervisor with Serial Services
 
 HTTP server that tracks USB serial device hotplug events and manages
 plain_rfc2217_server.py lifecycle.  On hotplug add → start proxy; on remove → stop it.
@@ -41,6 +41,22 @@ seq_counter: int = 0
 host_ip: str = "127.0.0.1"  # refreshed periodically; see _refresh_host_ip()
 hostname: str = "localhost"
 
+# Activity log — recent operations visible in UI
+import collections
+activity_log: collections.deque = collections.deque(maxlen=200)
+_enter_portal_running: bool = False
+
+
+def log_activity(msg: str, cat: str = "info"):
+    """Append a timestamped entry to the activity log."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "msg": msg,
+        "cat": cat,  # info, ok, error, step
+    }
+    activity_log.append(entry)
+    print(f"[activity] [{cat}] {msg}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -80,7 +96,21 @@ def load_config(path: str) -> dict[str, dict]:
 
 
 def get_host_ip() -> str:
-    """Detect host IP via UDP socket trick."""
+    """Detect host IP, preferring eth0 (wired management interface)."""
+    # Prefer eth0 — the wired management interface
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "eth0"],
+            timeout=2, stderr=subprocess.DEVNULL,
+        ).decode()
+        for part in out.split():
+            if "/" in part:
+                ip = part.split("/")[0]
+                if ip and not ip.startswith("127."):
+                    return ip
+    except Exception:
+        pass
+    # Fallback: UDP socket trick (picks default-route interface)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -332,6 +362,273 @@ def _slot_info(slot: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Serial Services — reset and monitor (FR-008, FR-009)
+# ---------------------------------------------------------------------------
+
+def _find_slot_by_label(label: str) -> dict | None:
+    """Find a configured slot by its human-readable label."""
+    for s in slots.values():
+        if s["label"] == label:
+            return s
+    return None
+
+
+def _read_serial_lines(ser, pattern: str | None, timeout: float) -> tuple[list[str], str | None]:
+    """Read serial lines until pattern matched or timeout.
+
+    Returns (lines, matched_line) where matched_line is None if no match.
+    """
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout
+    buf = b""
+    while time.monotonic() < deadline:
+        chunk = ser.read(512)
+        if chunk:
+            buf += chunk
+            text = buf.decode("utf-8", errors="replace")
+            new_lines = text.split("\n")
+            # Last element may be incomplete — keep in buf
+            if not text.endswith("\n"):
+                buf = new_lines.pop().encode("utf-8", errors="replace")
+            else:
+                buf = b""
+            for line in new_lines:
+                stripped = line.strip()
+                if stripped:
+                    lines.append(stripped)
+                    if pattern and pattern in stripped:
+                        return lines, stripped
+    # Process any remaining buffer
+    if buf:
+        stripped = buf.decode("utf-8", errors="replace").strip()
+        if stripped:
+            lines.append(stripped)
+            if pattern and pattern in stripped:
+                return lines, stripped
+    return lines, None
+
+
+def serial_reset(slot: dict) -> dict:
+    """FR-008: Reset device via DTR/RTS.  Stops proxy, opens direct serial,
+    sends reset pulse, reads initial boot output, closes.  Proxy restarts
+    via hotplug re-enumeration.
+
+    Returns {"ok": True/False, "output": [...], "error": "..."}.
+    """
+    import serial as pyserial
+
+    label = slot["label"]
+    devnode = slot.get("devnode")
+
+    if not devnode:
+        return {"ok": False, "error": f"{label}: no device node"}
+    if not slot.get("present"):
+        return {"ok": False, "error": f"{label}: device not present"}
+
+    # Stop the proxy so we can open direct serial
+    with slot["_lock"]:
+        stop_proxy(slot)
+
+    # Open direct serial with DTR/RTS safe
+    try:
+        ser = pyserial.Serial(devnode, 115200, timeout=0.1)
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(0.1)
+        ser.read(8192)  # drain
+    except Exception as e:
+        return {"ok": False, "error": f"Cannot open {devnode}: {e}"}
+
+    # Send DTR/RTS reset pulse
+    ser.dtr = True
+    time.sleep(0.05)
+    ser.dtr = False
+    time.sleep(0.05)
+    ser.rts = True
+    time.sleep(0.05)
+    ser.rts = False
+
+    # Read boot output (up to 5s)
+    lines, _ = _read_serial_lines(ser, None, timeout=5.0)
+    ser.close()
+
+    # Restart the proxy — DTR/RTS resets don't cause USB re-enumeration
+    # (the chip reboots but ttyACM stays), so hotplug won't restart it.
+    time.sleep(NATIVE_USB_BOOT_DELAY_S)
+    with slot["_lock"]:
+        if not slot["running"]:
+            start_proxy(slot)
+
+    return {"ok": True, "output": lines}
+
+
+def serial_monitor(slot: dict, pattern: str | None = None,
+                   timeout: float = 10.0) -> dict:
+    """FR-009: Read serial output via RFC2217 proxy (non-exclusive).
+
+    Returns {"ok": True, "matched": True/False, "line": "...", "output": [...]}.
+    """
+    import serial as pyserial
+
+    label = slot["label"]
+    tcp_port = slot.get("tcp_port")
+
+    if not tcp_port:
+        return {"ok": False, "error": f"{label}: no tcp_port configured"}
+    if not slot.get("running"):
+        return {"ok": False, "error": f"{label}: proxy not running"}
+
+    rfc2217_url = f"rfc2217://127.0.0.1:{tcp_port}"
+    try:
+        ser = pyserial.serial_for_url(rfc2217_url, do_not_open=True)
+        ser.baudrate = 115200
+        ser.timeout = 0.1
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+    except Exception as e:
+        return {"ok": False, "error": f"Cannot connect to {rfc2217_url}: {e}"}
+
+    try:
+        lines, matched_line = _read_serial_lines(ser, pattern, timeout)
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "matched": matched_line is not None,
+        "line": matched_line,
+        "output": lines,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Enter-portal — composite serial operation (FR-008 + FR-009)
+# ---------------------------------------------------------------------------
+
+def _do_enter_portal(slot: dict, num_resets: int = 3):
+    """Reset an ESP32 device repeatedly to trigger captive portal mode.
+
+    Uses direct serial (FR-008 serial_reset) for the reset pulses, keeping
+    the serial connection open across resets for rapid cycling.  This is
+    a composite operation built on the serial service primitives.
+    """
+    import serial as pyserial
+    import re
+
+    label = slot["label"]
+    devnode = slot.get("devnode")
+
+    if not devnode:
+        log_activity(f"{label}: no device node — is the device plugged in?", "error")
+        return
+
+    def _send_reset(ser):
+        """Send DTR/RTS reset pulse."""
+        ser.dtr = True;  time.sleep(0.05);  ser.dtr = False
+        time.sleep(0.05)
+        ser.rts = True;  time.sleep(0.05);  ser.rts = False
+
+    def _parse_ap_info(lines):
+        """Extract SSID and password from 'AP Started: ...' serial line."""
+        for l in lines:
+            if "AP Started:" not in l:
+                continue
+            ssid = pw = ""
+            m = re.search(r"SSID=(\S+)", l)
+            if m:
+                ssid = m.group(1).rstrip(",")
+            m = re.search(r"Pass=(\S+)", l)
+            if m:
+                pw = m.group(1).rstrip(",")
+            return ssid, pw
+        return "", ""
+
+    def _parse_wifi_info(lines):
+        """Extract SSID and IP from WiFi connect serial lines."""
+        for l in lines:
+            if "WiFi connected" not in l:
+                continue
+            m = re.search(r"IP:\s*(\S+)", l)
+            ip = m.group(1) if m else "?"
+            via = "NVS" if "via NVS" in l else "fallback"
+            return ip, via
+        return "", ""
+
+    # Stop proxy so we can use direct serial for rapid resets
+    with slot["_lock"]:
+        stop_proxy(slot)
+
+    # -- Open direct serial (not RFC2217) --
+    log_activity(f"Opening {label} direct serial ({devnode})...", "step")
+    try:
+        ser = pyserial.Serial(devnode, 115200, timeout=0.1)
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(0.1)
+        ser.read(8192)  # drain
+    except Exception as e:
+        log_activity(f"Cannot open {devnode}: {e}", "error")
+        return
+
+    # -- Step 1: clean boot (reset boot counter) --
+    log_activity(f"serial.reset({label}) — clean boot...", "step")
+    _send_reset(ser)
+    lines, matched = _read_serial_lines(ser, "Boot count reset to 0", timeout=15)
+    ip, via = _parse_wifi_info(lines)
+    if ip:
+        log_activity(f"{label} in NORMAL mode — WiFi ({via}) IP: {ip}", "ok")
+    else:
+        log_activity(f"{label} clean boot done", "info")
+    time.sleep(1)
+
+    # -- Step 2: N rapid resets --
+    log_activity(f"Sending {num_resets} rapid resets to trigger captive portal...", "step")
+    ser.read(8192)  # drain
+    for i in range(1, num_resets + 1):
+        log_activity(f"serial.reset({label}) — reset {i}/{num_resets}", "step")
+        _send_reset(ser)
+        lines, matched = _read_serial_lines(ser, "Boot count:", timeout=5)
+        boot_line = [l for l in lines if "Boot count:" in l and "threshold" in l]
+        if boot_line:
+            log_activity(f"serial.monitor({label}) — {boot_line[-1]}", "info")
+        else:
+            log_activity(f"Reset {i}/{num_resets} — no boot count detected", "error")
+            ser.close()
+            return
+
+        if i < num_resets:
+            time.sleep(0.3)  # minimal gap before next reset
+
+    # -- Step 3: check for portal mode --
+    log_activity(f"serial.monitor({label}, 'PORTAL mode') — waiting...", "step")
+    lines2, matched = _read_serial_lines(ser, "PORTAL mode", timeout=10)
+    all_lines = lines + lines2
+    if matched:
+        ssid, pw = _parse_ap_info(all_lines)
+        log_activity(
+            f"{label} in CAPTIVE PORTAL mode — "
+            f"SSID: {ssid}  Password: {pw}",
+            "ok",
+        )
+    else:
+        ip, via = _parse_wifi_info(all_lines)
+        if ip:
+            log_activity(
+                f"{label} stayed in NORMAL mode (IP: {ip}) — "
+                f"resets too slow, WiFi connected before portal threshold",
+                "error",
+            )
+        else:
+            log_activity(f"{label} — portal mode not detected", "error")
+
+    ser.close()
+
+
+# ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
 
@@ -388,6 +685,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/wifi/events":
             qs = parse_qs(parsed.query)
             self._handle_wifi_events(qs)
+        elif path == "/api/log":
+            qs = parse_qs(parsed.query)
+            self._handle_get_log(qs)
         elif path in ("/", "/index.html"):
             self._serve_ui()
         else:
@@ -398,6 +698,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/hotplug":
             self._handle_hotplug()
+        elif path == "/api/serial/reset":
+            self._handle_serial_reset()
+        elif path == "/api/serial/monitor":
+            self._handle_serial_monitor()
+        elif path == "/api/enter-portal":
+            self._handle_enter_portal()
         elif path == "/api/start":
             self._handle_start()
         elif path == "/api/stop":
@@ -547,6 +853,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         stop_proxy(s)
                 threading.Thread(target=_bg_stop, daemon=True).start()
 
+        log_activity(
+            f"USB {action}: {label} ({devnode or '?'})",
+            "ok" if action == "add" else "info",
+        )
         print(
             f"[portal] hotplug: {action} slot_key={slot_key} "
             f"devnode={devnode} seq={seq_counter}",
@@ -669,17 +979,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         password = body.get("pass", "")
         timeout = body.get("timeout", 15)
+        log_activity(f"WiFi STA joining '{ssid}'...", "step")
         try:
             result = wifi_controller.sta_join(ssid, password, timeout)
+            log_activity(f"WiFi STA connected to '{ssid}' — IP: {result.get('ip', '?')}", "ok")
             self._send_json({"ok": True, **result})
         except Exception as e:
+            log_activity(f"WiFi STA join failed: {e}", "error")
             self._send_json({"ok": False, "error": str(e)})
 
     def _handle_wifi_sta_leave(self):
+        log_activity("WiFi STA disconnecting", "step")
         try:
             wifi_controller.sta_leave()
+            log_activity("WiFi STA disconnected", "ok")
             self._send_json({"ok": True})
         except Exception as e:
+            log_activity(f"WiFi STA leave failed: {e}", "error")
             self._send_json({"ok": False, "error": str(e)})
 
     def _handle_wifi_http(self):
@@ -695,17 +1011,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers = body.get("headers")
         req_body = body.get("body")  # base64 encoded
         timeout = body.get("timeout", 10)
+        log_activity(f"HTTP relay {method} {url}", "step")
         try:
             result = wifi_controller.http_relay(method, url, headers, req_body, timeout)
+            log_activity(f"HTTP relay {method} {url} — {result.get('status', '?')}", "ok")
             self._send_json({"ok": True, **result})
         except Exception as e:
+            log_activity(f"HTTP relay failed: {e}", "error")
             self._send_json({"ok": False, "error": str(e)})
 
     def _handle_wifi_scan(self):
+        log_activity("WiFi scanning...", "step")
         try:
             result = wifi_controller.scan()
+            n = len(result.get("networks", []))
+            log_activity(f"WiFi scan found {n} networks", "ok")
             self._send_json({"ok": True, **result})
         except Exception as e:
+            log_activity(f"WiFi scan failed: {e}", "error")
             self._send_json({"ok": False, "error": str(e)})
 
     def _handle_wifi_events(self, qs):
@@ -733,6 +1056,97 @@ class Handler(http.server.BaseHTTPRequestHandler):
         wifi_controller.handle_lease_event(action, mac, ip, hostname)
         self._send_json({"ok": True})
 
+    # -- serial services (FR-008, FR-009) --
+
+    def _handle_serial_reset(self):
+        body = self._read_json() or {}
+        slot_label = body.get("slot")
+        if not slot_label:
+            self._send_json({"ok": False, "error": "missing 'slot' field"}, 400)
+            return
+        slot = _find_slot_by_label(slot_label)
+        if not slot:
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' not found"})
+            return
+        log_activity(f"serial.reset({slot_label})", "step")
+        result = serial_reset(slot)
+        if result["ok"]:
+            log_activity(f"serial.reset({slot_label}) — done, {len(result.get('output', []))} lines", "ok")
+        else:
+            log_activity(f"serial.reset({slot_label}) — {result.get('error', 'failed')}", "error")
+        self._send_json(result)
+
+    def _handle_serial_monitor(self):
+        body = self._read_json() or {}
+        slot_label = body.get("slot")
+        if not slot_label:
+            self._send_json({"ok": False, "error": "missing 'slot' field"}, 400)
+            return
+        slot = _find_slot_by_label(slot_label)
+        if not slot:
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' not found"})
+            return
+        pattern = body.get("pattern")
+        timeout = float(body.get("timeout", 10))
+        log_activity(f"serial.monitor({slot_label}, pattern={pattern!r}, timeout={timeout})", "step")
+        result = serial_monitor(slot, pattern, timeout)
+        if result["ok"]:
+            if result.get("matched"):
+                log_activity(f"serial.monitor({slot_label}) — matched: {result['line']}", "ok")
+            else:
+                log_activity(f"serial.monitor({slot_label}) — timeout, no match", "info")
+        else:
+            log_activity(f"serial.monitor({slot_label}) — {result.get('error', 'failed')}", "error")
+        self._send_json(result)
+
+    # -- activity log & enter-portal --
+
+    def _handle_get_log(self, qs):
+        since = qs.get("since", [None])[0]
+        entries = list(activity_log)
+        if since:
+            entries = [e for e in entries if e["ts"] > since]
+        self._send_json({"ok": True, "entries": entries})
+
+    def _handle_enter_portal(self):
+        global _enter_portal_running
+        body = self._read_json() or {}
+        slot_label = body.get("slot", "SLOT2")
+        num_resets = int(body.get("resets", 3))
+
+        if _enter_portal_running:
+            self._send_json({"ok": False, "error": "enter-portal already running"})
+            return
+
+        # Find slot by label
+        target_slot = _find_slot_by_label(slot_label)
+        if not target_slot:
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' not found"})
+            return
+        if not target_slot["tcp_port"]:
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' has no tcp_port"})
+            return
+
+        _enter_portal_running = True
+        log_activity(f"Enter-portal started for {slot_label}", "step")
+
+        def _bg_enter_portal(slot, n_resets):
+            global _enter_portal_running
+            try:
+                _do_enter_portal(slot, n_resets)
+            except Exception as e:
+                log_activity(f"Enter-portal error: {e}", "error")
+            finally:
+                _enter_portal_running = False
+
+        threading.Thread(
+            target=_bg_enter_portal,
+            args=(target_slot, num_resets),
+            daemon=True,
+        ).start()
+
+        self._send_json({"ok": True, "message": "enter-portal started in background"})
+
     def _serve_ui(self):
         html = _UI_HTML
         body = html.encode()
@@ -752,19 +1166,25 @@ _UI_HTML = """\
     <title>RFC2217 Serial Portal</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
+        html { height: 100%; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #1a1a2e;
             color: #eee;
             min-height: 100vh;
             padding: 20px;
+            display: flex; flex-direction: column;
         }
         h1 { text-align: center; margin-bottom: 30px; color: #00d4ff; }
         h2 { color: #00d4ff; margin: 30px 0 15px; text-align: center; }
+        .main-content {
+            max-width: 1000px; margin: 0 auto; width: 100%;
+            display: flex; flex-direction: column; flex: 1; min-height: 0;
+        }
         .slots {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px; max-width: 1000px; margin: 0 auto;
+            gap: 20px;
         }
         .slot {
             background: #16213e; border-radius: 12px; padding: 20px;
@@ -803,9 +1223,40 @@ _UI_HTML = """\
             background: rgba(231,76,60,0.15); border-radius: 4px; margin-top: 8px;
         }
         .info { text-align: center; color: #666; margin-top: 30px; font-size: 0.85em; }
+        /* Activity log */
+        .log-section {
+            margin: 20px 0 0;
+            background: #16213e; border-radius: 12px; padding: 20px;
+            border: 2px solid #0f3460;
+            display: flex; flex-direction: column;
+            flex: 1; min-height: 0;
+        }
+        .log-section h2 { margin: 0 0 10px; font-size: 1.1em; color: #eee; flex-shrink: 0; }
+        .log-entries {
+            background: #0a0a1a; border-radius: 8px; padding: 10px;
+            flex: 1; overflow-y: auto; font-family: monospace;
+            font-size: 0.82em; line-height: 1.6;
+        }
+        .log-entries:empty::after { content: 'No activity yet'; color: #555; }
+        .log-entry { white-space: pre-wrap; word-break: break-all; }
+        .log-entry .ts { color: #555; }
+        .log-entry.cat-info { color: #aaa; }
+        .log-entry.cat-step { color: #00d4ff; }
+        .log-entry.cat-ok { color: #2ecc71; }
+        .log-entry.cat-error { color: #ff6b6b; }
+        .log-actions { margin-top: 10px; display: flex; gap: 8px; }
+        .log-actions button {
+            background: #0f3460; color: #aaa; border: 1px solid #333;
+            padding: 6px 14px; border-radius: 6px; cursor: pointer;
+            font-size: 0.85em; transition: all 0.2s;
+        }
+        .log-actions button:hover { background: #1a4a7a; color: #eee; }
+        .log-actions button.primary { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; font-weight: bold; }
+        .log-actions button.primary:hover { background: #00b8d9; }
+        .log-actions button:disabled { background: #333; color: #555; cursor: not-allowed; }
         /* WiFi Tester section */
         .wifi-section {
-            max-width: 1000px; margin: 20px auto 0;
+            margin: 20px 0 0;
             background: #16213e; border-radius: 12px; padding: 20px;
             border: 2px solid #0f3460;
         }
@@ -841,6 +1292,7 @@ _UI_HTML = """\
 </head>
 <body>
     <h1 id="title">RFC2217 Serial Portal</h1>
+    <div class="main-content">
     <div class="slots" id="slots"></div>
     <h2>WiFi Tester</h2>
     <div class="wifi-section" id="wifi-section">
@@ -852,7 +1304,15 @@ _UI_HTML = """\
         </div>
         <div id="wifi-content"></div>
     </div>
+    <div class="log-section">
+        <h2>Activity Log</h2>
+        <div class="log-entries" id="log-entries"></div>
+        <div class="log-actions">
+            <button onclick="clearLog()">Clear</button>
+        </div>
+    </div>
     <div class="info" id="info">Auto-refresh every 2 seconds</div>
+    </div><!-- /main-content -->
 <script>
 let hostName = '';
 let hostIp = '';
@@ -1020,8 +1480,63 @@ function copyUrl(url, el) {
     setTimeout(() => { el.classList.remove('copied'); el.textContent = url; }, 1000);
 }
 
+let lastLogTs = '';
+
+async function fetchLog() {
+    try {
+        const url = lastLogTs ? '/api/log?since=' + encodeURIComponent(lastLogTs) : '/api/log';
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (data.entries && data.entries.length > 0) {
+            const el = document.getElementById('log-entries');
+            for (const e of data.entries) {
+                const div = document.createElement('div');
+                div.className = 'log-entry cat-' + (e.cat || 'info');
+                const t = new Date(e.ts);
+                const ts = t.toLocaleTimeString();
+                div.innerHTML = '<span class="ts">' + ts + '</span> ' + e.msg;
+                el.appendChild(div);
+                lastLogTs = e.ts;
+            }
+            el.scrollTop = el.scrollHeight;
+        }
+    } catch (e) { /* ignore */ }
+}
+
+async function enterPortal() {
+    const btn = document.getElementById('btn-enter-portal');
+    // Find first running slot
+    let slotLabel = 'SLOT2';
+    try {
+        const resp = await fetch('/api/devices');
+        const data = await resp.json();
+        const running = data.slots.find(s => s.running);
+        if (running) slotLabel = running.label;
+    } catch (e) { /* use default */ }
+    const slot = prompt('Slot to enter captive portal:', slotLabel);
+    if (!slot) return;
+    btn.disabled = true;
+    btn.textContent = 'Running...';
+    try {
+        await fetch('/api/enter-portal', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({slot: slot})
+        });
+    } catch (e) {
+        alert('Error: ' + e);
+    }
+    // Re-enable after 30s (operation runs in background)
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Enter Captive Portal'; }, 30000);
+}
+
+function clearLog() {
+    document.getElementById('log-entries').innerHTML = '';
+    lastLogTs = '';
+}
+
 async function refresh() {
-    await Promise.all([fetchDevices(), fetchWifi()]);
+    await Promise.all([fetchDevices(), fetchWifi(), fetchLog()]);
 }
 refresh();
 setInterval(refresh, 2000);
@@ -1054,7 +1569,7 @@ def main():
     http.server.HTTPServer.allow_reuse_address = True
     httpd = http.server.HTTPServer(addr, Handler)
     print(
-        f"[portal] v3 listening on http://0.0.0.0:{PORT}  "
+        f"[portal] v4 listening on http://0.0.0.0:{PORT}  "
         f"host_ip={host_ip}  hostname={hostname}",
         flush=True,
     )
