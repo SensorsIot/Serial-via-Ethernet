@@ -49,6 +49,7 @@ VERSION = "1.0.0-pi"
 _lock = threading.Lock()
 _ap_active = False
 _ap_ssid = ""
+_ap_password = ""
 _ap_channel = 0
 _ap_hostapd_proc = None
 _ap_dnsmasq_proc = None
@@ -56,6 +57,7 @@ _ap_dnsmasq_proc = None
 _sta_active = False
 _sta_ssid = ""
 _sta_wpa_proc = None
+_saved_ap = None  # saved AP config to restore after sta_leave
 
 _event_queue: Queue = Queue()
 _stations: dict = {}  # mac -> {mac, ip}
@@ -221,7 +223,7 @@ def _flush_addr():
 
 def ap_start(ssid, password="", channel=6):
     """Start SoftAP on wlan0. Returns dict with ip."""
-    global _ap_active, _ap_ssid, _ap_channel
+    global _ap_active, _ap_ssid, _ap_password, _ap_channel
     global _ap_hostapd_proc, _ap_dnsmasq_proc
 
     _check_wifi_testing_mode()
@@ -301,6 +303,7 @@ def ap_start(ssid, password="", channel=6):
 
         _ap_active = True
         _ap_ssid = ssid
+        _ap_password = password
         _ap_channel = channel
         _stations.clear()
 
@@ -315,7 +318,7 @@ def ap_stop():
 
 
 def _ap_stop_unlocked():
-    global _ap_active, _ap_ssid, _ap_channel
+    global _ap_active, _ap_ssid, _ap_password, _ap_channel
     global _ap_hostapd_proc, _ap_dnsmasq_proc
 
     _kill_proc(_ap_dnsmasq_proc)
@@ -325,6 +328,7 @@ def _ap_stop_unlocked():
 
     _ap_active = False
     _ap_ssid = ""
+    _ap_password = ""
     _ap_channel = 0
     _stations.clear()
 
@@ -369,11 +373,17 @@ def handle_lease_event(action, mac, ip, hostname=""):
 
 def sta_join(ssid, password="", timeout=15, _internal=False):
     """Join a WiFi network as a station. Returns dict with ip, gateway."""
-    global _sta_active, _sta_ssid, _sta_wpa_proc
+    global _sta_active, _sta_ssid, _sta_wpa_proc, _saved_ap
 
     if not _internal:
         _check_wifi_testing_mode()
     with _lock:
+        # Save AP config so sta_leave can restore it
+        if _ap_active:
+            _saved_ap = {"ssid": _ap_ssid, "password": _ap_password, "channel": _ap_channel}
+            logger.info("Saved AP config for restore: ssid=%s channel=%d", _ap_ssid, _ap_channel)
+        else:
+            _saved_ap = None
         _stop_all_unlocked()
         _ensure_work_dir()
 
@@ -492,9 +502,16 @@ def sta_join(ssid, password="", timeout=15, _internal=False):
 
 
 def sta_leave():
-    """Disconnect from a WiFi network."""
+    """Disconnect from a WiFi network. Restores AP if one was active before sta_join."""
+    global _saved_ap
     with _lock:
         _sta_stop_unlocked()
+        saved = _saved_ap
+        _saved_ap = None
+    # Restore AP outside lock (ap_start acquires lock)
+    if saved:
+        logger.info("Restoring AP after sta_leave: ssid=%s channel=%d", saved["ssid"], saved["channel"])
+        ap_start(saved["ssid"], password=saved["password"], channel=saved["channel"])
 
 
 def _sta_stop_unlocked():
