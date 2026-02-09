@@ -60,6 +60,48 @@ _human_confirmed: bool = False
 _human_message: str | None = None
 _human_lock = threading.Lock()
 
+# Test progress — test scripts push updates via POST /api/test/update,
+# UI polls via GET /api/test/progress.
+_test_lock = threading.Lock()
+_test_session = None  # dict or None; see _handle_test_update for schema
+
+# GPIO control — drive Pi GPIO pins from test scripts (e.g. hold DUT GPIO low)
+import gpiod
+
+_gpio_lock = threading.Lock()
+_gpio_chip = None       # gpiod.Chip, opened lazily
+_gpio_requests = {}     # pin -> gpiod.LineRequest
+GPIO_ALLOWED = {5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}
+
+
+def _gpio_set(pin, value):
+    """Set a GPIO pin: value=0 (low), 1 (high), or "z" (release to input/high-Z)."""
+    global _gpio_chip
+    with _gpio_lock:
+        if _gpio_chip is None:
+            _gpio_chip = gpiod.Chip("/dev/gpiochip0")
+
+        if value == "z":
+            # Release line back to input (high-Z)
+            if pin in _gpio_requests:
+                _gpio_requests[pin].release()
+                del _gpio_requests[pin]
+            return
+
+        # Request as output if not already
+        if pin not in _gpio_requests:
+            _gpio_requests[pin] = _gpio_chip.request_lines(
+                consumer="serial-portal",
+                config={pin: gpiod.LineSettings(
+                    direction=gpiod.Direction.OUTPUT,
+                    output_value=gpiod.Value(value),
+                )},
+            )
+        else:
+            _gpio_requests[pin].set_value(
+                pin, gpiod.Value(value)
+            )
+
 
 def log_activity(msg: str, cat: str = "info"):
     """Append a timestamped entry to the activity log."""
@@ -720,6 +762,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_get_log(qs)
         elif path == "/api/human/status":
             self._handle_human_status()
+        elif path == "/api/test/progress":
+            self._handle_test_progress()
+        elif path == "/api/gpio/status":
+            self._handle_gpio_status()
         elif path in ("/", "/index.html"):
             self._serve_ui()
         else:
@@ -760,6 +806,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_human_done()
         elif path == "/api/human/cancel":
             self._handle_human_cancel()
+        elif path == "/api/test/update":
+            self._handle_test_update()
+        elif path == "/api/gpio/set":
+            self._handle_gpio_set()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1264,6 +1314,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _human_event.set()
         self._send_json({"ok": True})
 
+    # -- test progress handlers --
+
+    def _handle_test_progress(self):
+        """GET /api/test/progress — UI polls this for test session state."""
+        with _test_lock:
+            if _test_session is None:
+                self._send_json({"ok": True, "active": False})
+            else:
+                self._send_json({"ok": True, "active": True, **_test_session})
+
+    def _handle_test_update(self):
+        """POST /api/test/update — test scripts push progress updates."""
+        global _test_session
+
+        body = self._read_json()
+        if not body:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+
+        with _test_lock:
+            # End session
+            if body.get("end"):
+                _test_session = None
+                self._send_json({"ok": True})
+                return
+
+            # Start session (spec field present)
+            if "spec" in body:
+                _test_session = {
+                    "spec": body["spec"],
+                    "phase": body.get("phase", ""),
+                    "total": body.get("total", 0),
+                    "completed": [],
+                    "current": None,
+                }
+
+            if _test_session is None:
+                self._send_json({"ok": False, "error": "no active session"}, 400)
+                return
+
+            # Update phase if provided
+            if "phase" in body and "spec" not in body:
+                _test_session["phase"] = body["phase"]
+
+            # Update total if provided
+            if "total" in body and "spec" not in body:
+                _test_session["total"] = body["total"]
+
+            # Update current test
+            if "current" in body:
+                _test_session["current"] = body["current"]
+
+            # Record a result
+            if "result" in body:
+                _test_session["completed"].append(body["result"])
+                _test_session["current"] = None
+
+        self._send_json({"ok": True})
+
+    # -- GPIO handlers --
+
+    def _handle_gpio_set(self):
+        body = self._read_json()
+        if not body:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+        pin = body.get("pin")
+        value = body.get("value")
+        if pin is None or value is None:
+            self._send_json({"ok": False, "error": "missing pin or value"}, 400)
+            return
+        if not isinstance(pin, int) or pin not in GPIO_ALLOWED:
+            self._send_json({"ok": False, "error": f"pin {pin} not in allowed set"}, 400)
+            return
+        if value not in (0, 1, "z"):
+            self._send_json({"ok": False, "error": "value must be 0, 1, or 'z'"}, 400)
+            return
+        try:
+            _gpio_set(pin, value)
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)})
+            return
+        self._send_json({"ok": True, "pin": pin, "value": value})
+
+    def _handle_gpio_status(self):
+        pins = {}
+        with _gpio_lock:
+            for pin, req in _gpio_requests.items():
+                try:
+                    val = req.get_value(pin)
+                    pins[str(pin)] = {"direction": "output", "value": val.value}
+                except Exception:
+                    pins[str(pin)] = {"direction": "output", "value": None}
+        self._send_json({"ok": True, "pins": pins})
+
     def _serve_ui(self):
         html = _UI_HTML
         body = html.encode()
@@ -1444,6 +1589,29 @@ _UI_HTML = """\
             border-radius: 8px; font-size: 1em; cursor: pointer;
         }
         .human-modal .btn-cancel:hover { background: #666; }
+        /* Test progress panel */
+        .test-section { margin: 20px 0 0; }
+        .test-progress { background: #16213e; border-radius: 12px; padding: 20px; border: 2px solid #0f3460; }
+        .test-header { font-size: 1.1em; color: #e0e0e0; margin-bottom: 10px; }
+        .test-bar-container { background: #333; border-radius: 4px; height: 8px; margin-bottom: 8px; }
+        .test-bar { background: #28a745; height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .test-counter { color: #999; font-size: 0.9em; margin-bottom: 12px; }
+        .test-current { padding: 12px; border-radius: 6px; margin-bottom: 12px;
+            background: #1a3a1a; border-left: 4px solid #28a745; }
+        .test-current.manual { background: #3a2a00; border-left: 4px solid #f0a030;
+            animation: manual-pulse 2s ease-in-out infinite; }
+        @keyframes manual-pulse {
+            0%, 100% { border-left-color: #f0a030; }
+            50% { border-left-color: #ff6600; }
+        }
+        .test-current .test-id { font-weight: bold; color: #fff; }
+        .test-current .test-step { color: #ccc; margin-top: 4px; }
+        .test-results { max-height: 200px; overflow-y: auto; }
+        .test-result { display: flex; gap: 10px; padding: 4px 0; font-size: 0.9em; color: #aaa; }
+        .test-result .badge { font-weight: bold; min-width: 40px; }
+        .test-result .badge.pass { color: #28a745; }
+        .test-result .badge.fail { color: #dc3545; }
+        .test-result .badge.skip { color: #ffc107; }
     </style>
 </head>
 <body>
@@ -1459,6 +1627,18 @@ _UI_HTML = """\
                     onclick="switchMode('serial-interface')">Serial Interface</button>
         </div>
         <div id="wifi-content"></div>
+    </div>
+    <div class="test-section" id="test-section" style="display:none">
+        <h2>Test Progress</h2>
+        <div class="test-progress">
+            <div class="test-header" id="test-header"></div>
+            <div class="test-bar-container">
+                <div class="test-bar" id="test-bar"></div>
+            </div>
+            <div class="test-counter" id="test-counter"></div>
+            <div class="test-current" id="test-current"></div>
+            <div class="test-results" id="test-results"></div>
+        </div>
     </div>
     <div class="log-section">
         <h2>Activity Log</h2>
@@ -1768,8 +1948,42 @@ document.getElementById('btn-human-cancel').addEventListener('click', async func
     btn.disabled = false;
 });
 
+async function fetchTestProgress() {
+    try {
+        const resp = await fetch('/api/test/progress');
+        const data = await resp.json();
+        const section = document.getElementById('test-section');
+        if (!data.active) { section.style.display = 'none'; return; }
+        section.style.display = '';
+
+        document.getElementById('test-header').textContent = data.spec + ' — ' + data.phase;
+        const done = data.completed.length;
+        const pct = data.total > 0 ? (done / data.total * 100) : 0;
+        document.getElementById('test-bar').style.width = pct + '%';
+        document.getElementById('test-counter').textContent = done + ' / ' + data.total + ' completed';
+
+        const cur = document.getElementById('test-current');
+        if (data.current) {
+            cur.style.display = '';
+            cur.className = 'test-current' + (data.current.manual ? ' manual' : '');
+            cur.innerHTML = '<div class="test-id">' + data.current.id + ': ' + data.current.name + '</div>'
+                + '<div class="test-step">' + data.current.step + '</div>';
+        } else {
+            cur.style.display = 'none';
+        }
+
+        const res = document.getElementById('test-results');
+        res.innerHTML = data.completed.slice().reverse().map(function(r) {
+            return '<div class="test-result"><span class="badge ' + r.result.toLowerCase() + '">'
+                + r.result + '</span><span>' + r.id + ': ' + r.name + '</span>'
+                + (r.details ? '<span style="color:#666"> — ' + r.details + '</span>' : '')
+                + '</div>';
+        }).join('');
+    } catch (e) { /* ignore */ }
+}
+
 async function refresh() {
-    await Promise.all([fetchDevices(), fetchWifi(), fetchLog(), fetchHuman()]);
+    await Promise.all([fetchDevices(), fetchWifi(), fetchLog(), fetchHuman(), fetchTestProgress()]);
 }
 refresh();
 setInterval(refresh, 2000);

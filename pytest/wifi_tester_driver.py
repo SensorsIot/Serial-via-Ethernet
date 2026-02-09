@@ -363,3 +363,38 @@ class WiFiTesterDriver:
         confirmed = result.get("confirmed", False)
         logger.info("Human interaction %s", "confirmed" if confirmed else "not confirmed")
         return confirmed
+
+    # ── Test progress ──────────────────────────────────────────────
+
+    def test_start(self, spec: str, phase: str, total: int) -> dict:
+        """Start a test session on the Pi UI."""
+        return self._api_post("/api/test/update",
+                              {"spec": spec, "phase": phase, "total": total})
+
+    def test_step(self, test_id: str, name: str, step: str,
+                  manual: bool = False) -> dict:
+        """Update the current test step shown on the Pi UI."""
+        return self._api_post("/api/test/update",
+                              {"current": {"id": test_id, "name": name,
+                                           "step": step, "manual": manual}})
+
+    def test_result(self, test_id: str, name: str, result: str,
+                    details: str = "") -> dict:
+        """Record a test result (PASS/FAIL/SKIP)."""
+        return self._api_post("/api/test/update",
+                              {"result": {"id": test_id, "name": name,
+                                          "result": result, "details": details}})
+
+    def test_end(self) -> dict:
+        """End the test session."""
+        return self._api_post("/api/test/update", {"end": True})
+
+    # ── GPIO control ──────────────────────────────────────────────────
+
+    def gpio_set(self, pin: int, value) -> dict:
+        """Set a GPIO pin on the Pi (0=low, 1=high, 'z'=release/high-Z)."""
+        return self._api_post("/api/gpio/set", {"pin": pin, "value": value})
+
+    def gpio_get(self) -> dict:
+        """Get current GPIO pin states."""
+        return self._api_get("/api/gpio/status")
