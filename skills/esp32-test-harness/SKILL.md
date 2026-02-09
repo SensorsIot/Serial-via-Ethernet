@@ -32,7 +32,7 @@ All test operations use `WiFiTesterDriver`. Set `PYTHONPATH` to import it:
 
 ```python
 import sys
-sys.path.insert(0, "/tmp/Serial-via-Ethernet/pytest")
+sys.path.insert(0, "/tmp/Universal-ESP32-Tester/pytest")
 from wifi_tester_driver import WiFiTesterDriver
 
 wt = WiFiTesterDriver("http://192.168.0.87:8080")
@@ -41,7 +41,7 @@ wt = WiFiTesterDriver("http://192.168.0.87:8080")
 Or from bash one-liners:
 
 ```bash
-PYTHONPATH=/tmp/Serial-via-Ethernet/pytest python3 -c "
+PYTHONPATH=/tmp/Universal-ESP32-Tester/pytest python3 -c "
 from wifi_tester_driver import WiFiTesterDriver
 wt = WiFiTesterDriver('http://192.168.0.87:8080')
 # ... operations ...

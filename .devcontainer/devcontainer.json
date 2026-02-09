@@ -1,10 +1,10 @@
 {
-    "name": "USB-Serial-via-Ethernet - Python Development",
+    "name": "Universal-ESP32-Tester - Python Development",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."
     },
-    "workspaceFolder": "/workspaces/USB-Serial-via-Ethernet",
+    "workspaceFolder": "/workspaces/Universal-ESP32-Tester",
     "customizations": {
         "vscode": {
             "extensions": [
