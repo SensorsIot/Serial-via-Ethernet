@@ -777,7 +777,7 @@ without requiring the rapid-reset approach or physical button presses.
 **Pin allowlist:** Only these Pi GPIO pins may be controlled:
 
 ```
-{5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}
+{5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}
 ```
 
 Requests for pins outside this set return HTTP 400.

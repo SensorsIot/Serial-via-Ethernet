@@ -229,7 +229,7 @@ Wire Pi GPIO pins to DUT pins for automated hardware control:
 |---------------|----------|----------|-------------|
 | 17 | 2 | Captive portal trigger | LOW |
 
-**Pin allowlist:** `{5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}`
+**Pin allowlist:** `{5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}`
 
 Always release pins after use: `ut.gpio_set(17, "z")`
 

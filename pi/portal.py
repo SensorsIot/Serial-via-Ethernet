@@ -72,7 +72,7 @@ _gpio_lock = threading.Lock()
 _gpio_chip = None       # gpiod.Chip, opened lazily
 _gpio_requests = {}     # pin -> gpiod.LineRequest
 _gpio_directions = {}   # pin -> "output" | "input"
-GPIO_ALLOWED = {5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26}
+GPIO_ALLOWED = {5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}  # BCM GPIOs safe for DUT control
 
 
 def _gpio_set(pin, value):
