@@ -1525,40 +1525,6 @@ _UI_HTML = """\
         .log-actions button.primary { background: #00d4ff; color: #1a1a2e; border-color: #00d4ff; font-weight: bold; }
         .log-actions button.primary:hover { background: #00b8d9; }
         .log-actions button:disabled { background: #333; color: #555; cursor: not-allowed; }
-        /* WiFi Tester section */
-        .wifi-section {
-            margin: 20px 0 0;
-            background: #16213e; border-radius: 12px; padding: 20px;
-            border: 2px solid #0f3460;
-        }
-        .wifi-section.active { border-color: #00d4ff; box-shadow: 0 0 20px rgba(0,212,255,0.2); }
-        .mode-toggle {
-            display: flex; gap: 0; margin-bottom: 20px;
-            border-radius: 8px; overflow: hidden; border: 1px solid #0f3460;
-        }
-        .mode-btn {
-            flex: 1; padding: 10px 15px; border: none;
-            background: #0f3460; color: #aaa; cursor: pointer;
-            font-size: 0.95em; font-weight: bold; transition: all 0.2s;
-        }
-        .mode-btn.active { background: #00d4ff; color: #1a1a2e; }
-        .mode-btn:hover:not(.active) { background: #1a4a7a; color: #eee; }
-        .wifi-status { font-size: 0.9em; color: #aaa; }
-        .wifi-status div { margin: 5px 0; }
-        .wifi-status span { color: #00d4ff; font-family: monospace; }
-        .wifi-form { margin-top: 15px; }
-        .wifi-form input {
-            background: #0f3460; border: 1px solid #333; color: #eee;
-            padding: 8px 12px; border-radius: 6px; margin-right: 8px;
-            font-size: 0.9em; width: 180px;
-        }
-        .wifi-form button {
-            background: #00d4ff; color: #1a1a2e; border: none;
-            padding: 8px 20px; border-radius: 6px; cursor: pointer;
-            font-weight: bold; font-size: 0.9em;
-        }
-        .wifi-form button:hover { background: #00b8d9; }
-        .wifi-form button:disabled { background: #555; color: #888; cursor: not-allowed; }
         /* Human interaction request overlay */
         .human-overlay {
             display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -1618,17 +1584,7 @@ _UI_HTML = """\
     <h1 id="title">RFC2217 Serial Portal</h1>
     <div class="main-content">
     <div class="slots" id="slots"></div>
-    <h2>WiFi Tester</h2>
-    <div class="wifi-section" id="wifi-section">
-        <div class="mode-toggle">
-            <button class="mode-btn active" id="btn-wifi-testing"
-                    onclick="switchMode('wifi-testing')">WiFi-Testing</button>
-            <button class="mode-btn" id="btn-serial-interface"
-                    onclick="switchMode('serial-interface')">Serial Interface</button>
-        </div>
-        <div id="wifi-content"></div>
-    </div>
-    <div class="test-section" id="test-section" style="display:none">
+    <div class="test-section" id="test-section">
         <h2>Test Progress</h2>
         <div class="test-progress">
             <div class="test-header" id="test-header"></div>
@@ -1663,9 +1619,6 @@ _UI_HTML = """\
 <script>
 let hostName = '';
 let hostIp = '';
-let currentMode = 'wifi-testing';
-let switching = false;
-
 async function fetchDevices() {
     try {
         const resp = await fetch('/api/devices');
@@ -1677,29 +1630,13 @@ async function fetchDevices() {
             document.title = hostName + ' — Serial Portal';
         }
         renderSlots(data.slots);
+        document.getElementById('info').textContent =
+            'Hostname: ' + hostName + '  |  IP: ' + hostIp + '  |  Auto-refresh every 2s';
     } catch (e) {
         console.error('Error fetching devices:', e);
     }
 }
 
-async function fetchWifi() {
-    try {
-        const [modeResp, apResp] = await Promise.all([
-            fetch('/api/wifi/mode'),
-            fetch('/api/wifi/ap_status')
-        ]);
-        const modeData = await modeResp.json();
-        const apData = await apResp.json();
-        if (!switching) {
-            currentMode = modeData.mode || 'wifi-testing';
-            renderWifi(modeData, apData);
-        }
-        document.getElementById('info').textContent =
-            'Hostname: ' + hostName + '  |  IP: ' + hostIp + '  |  Auto-refresh every 2s';
-    } catch (e) {
-        console.error('Error fetching wifi:', e);
-    }
-}
 
 function slotStatus(s) {
     if (s.state) return s.state;
@@ -1742,83 +1679,6 @@ function renderSlots(slots) {
     }).join('');
 }
 
-function renderWifi(modeData, apData) {
-    const section = document.getElementById('wifi-section');
-    const btnWT = document.getElementById('btn-wifi-testing');
-    const btnSI = document.getElementById('btn-serial-interface');
-    const content = document.getElementById('wifi-content');
-
-    const mode = modeData.mode || 'wifi-testing';
-    btnWT.className = 'mode-btn' + (mode === 'wifi-testing' ? ' active' : '');
-    btnSI.className = 'mode-btn' + (mode === 'serial-interface' ? ' active' : '');
-
-    if (mode === 'wifi-testing') {
-        section.className = 'wifi-section' + (apData.active ? ' active' : '');
-        let html = '<div class="wifi-status">';
-        html += '<div>Mode: <span>WiFi-Testing</span> (wlan0 = test instrument)</div>';
-        if (apData.active) {
-            html += '<div>AP: <span>' + apData.ssid + '</span> (channel ' + apData.channel + ')</div>';
-            const cnt = apData.stations ? apData.stations.length : 0;
-            html += '<div>Stations: <span>' + cnt + '</span></div>';
-        } else {
-            html += '<div>AP: <span style="color:#666">inactive</span></div>';
-        }
-        html += '</div>';
-        content.innerHTML = html;
-    } else {
-        section.className = 'wifi-section active';
-        let html = '<div class="wifi-status">';
-        html += '<div>Mode: <span>Serial Interface</span> (wlan0 = LAN, WiFi testing disabled)</div>';
-        if (modeData.ssid) {
-            html += '<div>Connected: <span>' + modeData.ssid + '</span>';
-            if (modeData.ip) html += ' (' + modeData.ip + ')';
-            html += '</div>';
-        }
-        html += '</div>';
-        content.innerHTML = html;
-    }
-}
-
-async function switchMode(mode) {
-    if (switching || mode === currentMode) return;
-    if (mode === 'serial-interface') {
-        const ssid = prompt('WiFi SSID to connect:');
-        if (!ssid) return;
-        const pass = prompt('WiFi password (leave empty for open):') || '';
-        switching = true;
-        document.getElementById('btn-serial-interface').textContent = 'Switching...';
-        try {
-            const resp = await fetch('/api/wifi/mode', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({mode: 'serial-interface', ssid: ssid, pass: pass})
-            });
-            const data = await resp.json();
-            if (!data.ok) alert('Error: ' + data.error);
-        } catch (e) {
-            alert('Error switching mode: ' + e);
-        }
-        switching = false;
-        document.getElementById('btn-serial-interface').textContent = 'Serial Interface';
-    } else {
-        switching = true;
-        document.getElementById('btn-wifi-testing').textContent = 'Switching...';
-        try {
-            const resp = await fetch('/api/wifi/mode', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({mode: 'wifi-testing'})
-            });
-            const data = await resp.json();
-            if (!data.ok) alert('Error: ' + data.error);
-        } catch (e) {
-            alert('Error switching mode: ' + e);
-        }
-        switching = false;
-        document.getElementById('btn-wifi-testing').textContent = 'WiFi-Testing';
-    }
-    fetchWifi();
-}
 
 function copyUrl(url, el) {
     navigator.clipboard.writeText(url);
@@ -1952,9 +1812,15 @@ async function fetchTestProgress() {
     try {
         const resp = await fetch('/api/test/progress');
         const data = await resp.json();
-        const section = document.getElementById('test-section');
-        if (!data.active) { section.style.display = 'none'; return; }
-        section.style.display = '';
+
+        if (!data.active) {
+            document.getElementById('test-header').textContent = 'No test session active';
+            document.getElementById('test-bar').style.width = '0%';
+            document.getElementById('test-counter').textContent = '';
+            document.getElementById('test-current').style.display = 'none';
+            document.getElementById('test-results').innerHTML = '';
+            return;
+        }
 
         document.getElementById('test-header').textContent = data.spec + ' — ' + data.phase;
         const done = data.completed.length;
@@ -1983,7 +1849,7 @@ async function fetchTestProgress() {
 }
 
 async function refresh() {
-    await Promise.all([fetchDevices(), fetchWifi(), fetchLog(), fetchHuman(), fetchTestProgress()]);
+    await Promise.all([fetchDevices(), fetchLog(), fetchHuman(), fetchTestProgress()]);
 }
 refresh();
 setInterval(refresh, 2000);
