@@ -88,19 +88,19 @@ def _gpio_set(pin, value):
                 del _gpio_requests[pin]
             return
 
+        gval = gpiod.line.Value.ACTIVE if value else gpiod.line.Value.INACTIVE
+
         # Request as output if not already
         if pin not in _gpio_requests:
             _gpio_requests[pin] = _gpio_chip.request_lines(
                 consumer="serial-portal",
                 config={pin: gpiod.LineSettings(
-                    direction=gpiod.Direction.OUTPUT,
-                    output_value=gpiod.Value(value),
+                    direction=gpiod.line.Direction.OUTPUT,
+                    output_value=gval,
                 )},
             )
         else:
-            _gpio_requests[pin].set_value(
-                pin, gpiod.Value(value)
-            )
+            _gpio_requests[pin].set_value(pin, gval)
 
 
 def log_activity(msg: str, cat: str = "info"):
