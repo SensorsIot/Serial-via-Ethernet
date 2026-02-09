@@ -595,6 +595,11 @@ serial-interface mode.
 | POST | /api/wifi/http | HTTP relay through Pi's radio |
 | GET | /api/wifi/events | Event queue (long-poll supported) |
 | POST | /api/wifi/lease_event | Receive dnsmasq lease callback |
+| **Human Interaction** | | |
+| POST | /api/human-interaction | Block until operator confirms a physical action (FR-017) |
+| GET | /api/human/status | Check if a human interaction request is pending |
+| POST | /api/human/done | Operator confirms action complete (wakes blocked request) |
+| POST | /api/human/cancel | Operator or test script cancels request |
 | **Composite** | | |
 | GET | /api/log | Activity log (timestamped entries, filterable with `?since=`) |
 | POST | /api/enter-portal | Trigger DUT captive portal via serial reset/monitor sequence |
@@ -697,6 +702,65 @@ WiFi side of the network:
 - While in serial-interface mode, tester endpoints (`ap_start`, `ap_stop`,
   `sta_join`, `sta_leave`, `scan`, `http`) return a guard error
 
+### FR-017 — Human Interaction Request
+
+Some test steps require physical actions that cannot be automated — pressing a
+button, connecting a cable, power-cycling a device, repositioning an antenna.
+The human interaction endpoint lets test scripts request operator assistance via
+the web UI and block until the action is confirmed.
+
+**Endpoint:** `POST /api/human-interaction`
+
+**Request body:**
+```json
+{"message": "Connect the USB cable to port 2 and click Done", "timeout": 120}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| message | string | Yes | — | Free-text instruction displayed to operator |
+| timeout | number | No | 120 | Max seconds to wait for confirmation |
+
+**Behaviour:**
+
+1. Server stores the message and creates a `threading.Event`
+2. Server blocks the HTTP response on `event.wait(timeout)`
+3. Web UI polls `GET /api/human/status` (every 2s via existing refresh loop)
+   and shows a pulsing orange modal overlay with the message text
+4. Operator performs the action, then clicks **Done** (`POST /api/human/done`)
+   or **Cancel** (`POST /api/human/cancel`)
+5. Done/Cancel sets the event — the blocked handler wakes and returns immediately
+6. If timeout expires before confirmation, handler returns with `timeout: true`
+
+**Response (confirmed):**
+```json
+{"ok": true, "confirmed": true}
+```
+
+**Response (cancelled):**
+```json
+{"ok": true, "confirmed": false}
+```
+
+**Response (timeout):**
+```json
+{"ok": true, "confirmed": false, "timeout": true}
+```
+
+**Concurrency:** Only one request can be pending at a time. A second request
+while one is active returns `409 Conflict`. The portal uses
+`ThreadingHTTPServer` so the blocked handler does not prevent other API
+requests from being served.
+
+**Driver method:**
+```python
+wt.human_interaction("Press the reset button and click Done", timeout=60)
+# Returns True if confirmed, False if cancelled or timed out
+```
+
+**Activity log:** Each request, confirmation, cancellation, and timeout is
+logged to the activity log.
+
 ---
 
 ## 5. Web Portal
@@ -716,8 +780,13 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
   triggers `POST /api/enter-portal` to run rapid-reset sequence on a
   selected slot.  "Clear" button resets the display.  Log is polled every
   2 seconds via `GET /api/log?since=<last_ts>`.
+- **Human interaction modal** — full-screen dark overlay with pulsing orange
+  border, shown when a test script posts a human interaction request.
+  Displays the operator instruction text with Done and Cancel buttons.
+  Polled via `GET /api/human/status` as part of the auto-refresh cycle.
 - **Auto-refresh** — every 2 seconds via `setInterval`, fetches
-  `/api/devices`, `/api/wifi/mode`, `/api/wifi/ap_status`, and `/api/log`
+  `/api/devices`, `/api/wifi/mode`, `/api/wifi/ap_status`, `/api/log`,
+  and `/api/human/status`
 - **Title** — shows `{hostname} — Serial Portal` when hostname is available
 
 ---
@@ -829,6 +898,11 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | WT-602 | Own AP excluded | WiFi Scan | No |
 | WT-603 | Scan while AP running | WiFi Scan | No |
 
+| WT-700 | Human interaction confirm | Human Interaction | No |
+| WT-701 | Human interaction cancel | Human Interaction | No |
+| WT-702 | Human interaction timeout | Human Interaction | No |
+| WT-703 | Concurrent request rejected | Human Interaction | No |
+
 \* WT-503/504 require a running AP (wifi_network fixture) but not a physical DUT.
 
 ---
@@ -848,6 +922,7 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 5.3 | 2026-02-08 | Claude | Activity log system (`GET /api/log`, `POST /api/enter-portal` for captive portal trigger via rapid resets); WiFi tester fixes (stale wpa_supplicant socket cleanup, `ctrl_interface=` in wpa_passphrase output, `dhcpcd` DHCP client support); activity logging for hotplug events and WiFi tester operations; activity log UI panel with colour-coded entries |
 | 5.2 | 2026-02-08 | Claude | Removed esp_rfc2217_server.py and serial_proxy.py (no longer installed); proxy auto-restart after esptool USB re-enumeration (background stop_proxy, BrokenPipeError fix, curl timeout 10s); FR-004 logging removed; updated deliverables |
 | 6.0 | 2026-02-08 | Claude | Service separation — Serial and WiFi as independent services with state models (§1.6); serial reset (FR-008) and serial monitor (FR-009) as first-class API operations; flapping recovery via active reset; WiFi section renamed to WiFi Service with states Idle/Captive/AP; enter-portal rewritten as composite serial operation; consolidated API table (FR-010) |
+| 6.1 | 2026-02-09 | Claude | Human interaction request (FR-017): blocking endpoint for test steps requiring physical operator actions; pulsing orange UI modal; ThreadingHTTPServer for concurrent requests; driver `human_interaction()` method; WT-700–703 test cases |
 
 ---
 
@@ -1115,6 +1190,14 @@ Add this to /etc/rfc2217/slots.json:
 - [x] TASK-029: Activity log UI panel with enter-portal button
 - [x] TASK-040: WiFi Tester stale wpa_supplicant socket cleanup
 - [x] TASK-041: wpa_passphrase ctrl_interface fix for wpa_cli compatibility
+
+**Human Interaction (v6.1):**
+- [x] TASK-060: Implement `POST /api/human-interaction` with blocking Event (FR-017)
+- [x] TASK-061: Implement `GET /api/human/status`, `POST /api/human/done`, `POST /api/human/cancel`
+- [x] TASK-062: Human interaction modal in web UI (pulsing orange overlay, Done/Cancel)
+- [x] TASK-063: Switch to `ThreadingHTTPServer` for concurrent request handling
+- [x] TASK-064: Add `human_interaction()` method to `wifi_tester_driver.py`
+- [x] TASK-065: Add `Cache-Control: no-cache` to UI HTML response
 
 ### C.2 Deliverables
 

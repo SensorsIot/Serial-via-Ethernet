@@ -342,3 +342,24 @@ class WiFiTesterDriver:
             path += f"?since={since}"
         result = self._api_get(path, timeout=10)
         return result.get("entries", [])
+
+    # ── Human interaction ───────────────────────────────────────────
+
+    def human_interaction(self, message: str, timeout: float = 120) -> bool:
+        """Ask a human operator to perform a physical action.
+
+        Displays *message* as a popup on the Pi's web UI.  The call blocks
+        (server-side, event-driven — no polling) until the operator clicks
+        Done or Cancel, or *timeout* expires.
+
+        Returns True if confirmed, False if cancelled or timed out.
+        """
+        logger.info("Human interaction: %s", message)
+        result = self._api_post(
+            "/api/human-interaction",
+            {"message": message, "timeout": timeout},
+            timeout=timeout + 10,
+        )
+        confirmed = result.get("confirmed", False)
+        logger.info("Human interaction %s", "confirmed" if confirmed else "not confirmed")
+        return confirmed

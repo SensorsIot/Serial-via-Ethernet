@@ -53,6 +53,13 @@ import collections
 activity_log: collections.deque = collections.deque(maxlen=200)
 _enter_portal_running: bool = False
 
+# Human interaction — test scripts block on POST /api/human-interaction
+# until the operator clicks Done/Cancel on the web UI.
+_human_event: threading.Event | None = None
+_human_confirmed: bool = False
+_human_message: str | None = None
+_human_lock = threading.Lock()
+
 
 def log_activity(msg: str, cat: str = "info"):
     """Append a timestamped entry to the activity log."""
@@ -711,6 +718,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/log":
             qs = parse_qs(parsed.query)
             self._handle_get_log(qs)
+        elif path == "/api/human/status":
+            self._handle_human_status()
         elif path in ("/", "/index.html"):
             self._serve_ui()
         else:
@@ -745,6 +754,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_wifi_http()
         elif path == "/api/wifi/lease_event":
             self._handle_wifi_lease_event()
+        elif path == "/api/human-interaction":
+            self._handle_human_interaction()
+        elif path == "/api/human/done":
+            self._handle_human_done()
+        elif path == "/api/human/cancel":
+            self._handle_human_cancel()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1180,11 +1195,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_json({"ok": True, "message": "enter-portal started in background"})
 
+    # -- human interaction handlers (event-driven, blocking) --
+
+    def _handle_human_interaction(self):
+        """Blocking endpoint — stays open until human clicks Done/Cancel or timeout."""
+        global _human_event, _human_confirmed, _human_message
+
+        body = self._read_json()
+        if not body or not body.get("message"):
+            self._send_json({"ok": False, "error": "missing message"}, 400)
+            return
+        timeout = float(body.get("timeout", 120))
+
+        with _human_lock:
+            if _human_event is not None:
+                self._send_json({"ok": False, "error": "another request pending"}, 409)
+                return
+            _human_event = threading.Event()
+            _human_confirmed = False
+            _human_message = body["message"]
+
+        log_activity(f"Human interaction: {body['message']}", "step")
+
+        # Block here until Done/Cancel or timeout
+        responded = _human_event.wait(timeout=timeout)
+
+        with _human_lock:
+            confirmed = _human_confirmed
+            msg = _human_message
+            _human_event = None
+            _human_message = None
+
+        if responded:
+            cat = "ok" if confirmed else "info"
+            log_activity(f"Human {'confirmed' if confirmed else 'cancelled'}: {msg}", cat)
+            self._send_json({"ok": True, "confirmed": confirmed})
+        else:
+            log_activity(f"Human interaction timed out: {msg}", "error")
+            self._send_json({"ok": True, "confirmed": False, "timeout": True})
+
+    def _handle_human_status(self):
+        """UI polls this to show/hide the modal."""
+        with _human_lock:
+            if _human_event is not None and not _human_event.is_set():
+                self._send_json({"ok": True, "pending": True, "message": _human_message})
+            else:
+                self._send_json({"ok": True, "pending": False, "message": ""})
+
+    def _handle_human_done(self):
+        """UI Done button — wakes the blocking handler with confirmed=True."""
+        global _human_confirmed
+        with _human_lock:
+            if _human_event is None or _human_event.is_set():
+                self._send_json({"ok": False, "error": "no pending request"})
+                return
+            _human_confirmed = True
+            _human_event.set()
+        self._send_json({"ok": True})
+
+    def _handle_human_cancel(self):
+        """UI Cancel button — wakes the blocking handler with confirmed=False."""
+        global _human_confirmed
+        with _human_lock:
+            if _human_event is None or _human_event.is_set():
+                self._send_json({"ok": False, "error": "no pending request"})
+                return
+            _human_confirmed = False
+            _human_event.set()
+        self._send_json({"ok": True})
+
     def _serve_ui(self):
         html = _UI_HTML
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
@@ -1329,6 +1414,36 @@ _UI_HTML = """\
         }
         .wifi-form button:hover { background: #00b8d9; }
         .wifi-form button:disabled { background: #555; color: #888; cursor: not-allowed; }
+        /* Human interaction request overlay */
+        .human-overlay {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); z-index: 9999;
+            justify-content: center; align-items: center;
+        }
+        .human-overlay.visible { display: flex; }
+        .human-modal {
+            background: #1a1a2e; border: 3px solid #ff8c00; border-radius: 16px;
+            padding: 40px; max-width: 520px; width: 90%; text-align: center;
+            animation: pulse-border 2s ease-in-out infinite;
+        }
+        @keyframes pulse-border {
+            0%, 100% { border-color: #ff8c00; box-shadow: 0 0 20px rgba(255,140,0,0.3); }
+            50% { border-color: #ffa500; box-shadow: 0 0 40px rgba(255,165,0,0.6); }
+        }
+        .human-modal h2 { color: #ff8c00; margin: 0 0 10px; font-size: 1.4em; }
+        .human-modal .human-message { color: #eee; font-size: 1.2em; margin: 20px 0 25px; line-height: 1.5; }
+        .human-modal .human-status { color: #aaa; font-size: 0.9em; margin: 10px 0; min-height: 1.2em; }
+        .human-modal .human-buttons { display: flex; gap: 15px; justify-content: center; }
+        .human-modal .btn-done {
+            background: #28a745; color: #fff; border: none; padding: 12px 40px;
+            border-radius: 8px; font-size: 1.1em; font-weight: bold; cursor: pointer;
+        }
+        .human-modal .btn-done:hover { background: #218838; }
+        .human-modal .btn-cancel {
+            background: #555; color: #ccc; border: none; padding: 12px 30px;
+            border-radius: 8px; font-size: 1em; cursor: pointer;
+        }
+        .human-modal .btn-cancel:hover { background: #666; }
     </style>
 </head>
 <body>
@@ -1354,6 +1469,17 @@ _UI_HTML = """\
     </div>
     <div class="info" id="info">Auto-refresh every 2 seconds</div>
     </div><!-- /main-content -->
+    <div class="human-overlay" id="human-overlay">
+        <div class="human-modal">
+            <h2>Action Required</h2>
+            <div class="human-message" id="human-message"></div>
+            <div class="human-status" id="human-status"></div>
+            <div class="human-buttons">
+                <button class="btn-done" id="btn-human-done">Done</button>
+                <button class="btn-cancel" id="btn-human-cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
 <script>
 let hostName = '';
 let hostIp = '';
@@ -1576,8 +1702,74 @@ function clearLog() {
     lastLogTs = '';
 }
 
+let humanPending = false;
+
+async function fetchHuman() {
+    try {
+        const resp = await fetch('/api/human/status');
+        const data = await resp.json();
+        const overlay = document.getElementById('human-overlay');
+        if (data.pending) {
+            if (!humanPending) {
+                document.getElementById('human-message').textContent = data.message;
+                document.getElementById('human-status').textContent = '';
+                overlay.classList.add('visible');
+            }
+            humanPending = true;
+        } else {
+            if (humanPending) {
+                overlay.classList.remove('visible');
+                document.getElementById('human-status').textContent = '';
+            }
+            humanPending = false;
+        }
+    } catch (e) { /* ignore */ }
+}
+
+document.getElementById('btn-human-done').addEventListener('click', async function() {
+    const btn = this;
+    const statusEl = document.getElementById('human-status');
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    statusEl.textContent = '';
+    try {
+        const resp = await fetch('/api/human/done', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: '{}'
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            document.getElementById('human-overlay').classList.remove('visible');
+            humanPending = false;
+        } else {
+            statusEl.textContent = data.error || 'Failed';
+        }
+    } catch (e) { statusEl.textContent = 'Error: ' + e; }
+    btn.disabled = false;
+    btn.textContent = 'Done';
+});
+
+document.getElementById('btn-human-cancel').addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    try {
+        const resp = await fetch('/api/human/cancel', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: '{}'
+        });
+        const data = await resp.json();
+        if (data && data.ok) {
+            document.getElementById('human-overlay').classList.remove('visible');
+            humanPending = false;
+        }
+    } catch (e) { /* ignore */ }
+    btn.disabled = false;
+});
+
 async function refresh() {
-    await Promise.all([fetchDevices(), fetchWifi(), fetchLog()]);
+    await Promise.all([fetchDevices(), fetchWifi(), fetchLog(), fetchHuman()]);
 }
 refresh();
 setInterval(refresh, 2000);
@@ -1607,8 +1799,8 @@ def main():
     scan_existing_devices()
 
     addr = ("", PORT)
-    http.server.HTTPServer.allow_reuse_address = True
-    httpd = http.server.HTTPServer(addr, Handler)
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    httpd = http.server.ThreadingHTTPServer(addr, Handler)
     print(
         f"[portal] v4 listening on http://0.0.0.0:{PORT}  "
         f"host_ip={host_ip}  hostname={hostname}",
