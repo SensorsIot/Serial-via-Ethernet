@@ -1362,6 +1362,64 @@ Where SLOT1 is the JTAG interface and SLOT2 is the UART bridge.  Label
 convention: append `-jtag` and `-uart` to the label when documenting for
 clarity.
 
+### 6.7 GPIO Control Probe — Auto-Detecting Board Capabilities
+
+Not all boards have their EN/BOOT pins wired to the Pi's GPIO headers.
+Dual-USB hub boards have an onboard auto-download circuit that handles
+reset and boot mode via DTR/RTS on the USB-Serial/JTAG interface, making
+external GPIO wiring unnecessary.  Single-USB boards **may or may not**
+have GPIO wires connected.
+
+The tester can auto-detect whether a board responds to Pi GPIO control
+using a two-step probe:
+
+#### Probe Algorithm
+
+```
+Step 1: Try GPIO-based download mode entry
+  1a. Drive Pi GPIO18 LOW (BOOT pin)
+  1b. Pulse Pi GPIO17 LOW then HIGH (EN/RST pin)
+  1c. Release Pi GPIO18 to hi-Z
+  1d. Monitor slot serial output for 3 seconds
+  1e. Check boot mode in output:
+      - "DOWNLOAD" in boot mode string → GPIO controls this board ✓
+      - No output or normal boot mode → GPIO has no effect, go to Step 2
+
+Step 2: Try USB DTR/RTS reset (fallback)
+  2a. POST /api/serial/reset on the slot
+  2b. Check boot output:
+      - Got output with rst type indicating hardware reset → USB reset works
+      - No output → slot may be wrong type or device not responding
+```
+
+#### Interpreting Results
+
+| GPIO probe result | USB reset result | Conclusion |
+|-------------------|-----------------|------------|
+| DOWNLOAD mode | — | **GPIO-controlled board** — Pi GPIOs are wired to EN/BOOT |
+| No effect | Hardware reset output | **USB-controlled board** — no GPIO wiring; use DTR/RTS via serial reset |
+| No effect | No output | **No control available** — check wiring, or board may be on a different slot |
+| DOWNLOAD mode | Also works | GPIO wired AND USB works — prefer USB (less invasive) |
+
+#### Key Indicators in Serial Output
+
+- **Reset reason (`rst:`)**: `0x1` = power-on, `0x3` = software, `0xc` = RTC watchdog/panic,
+  `0x15` = USB_UART_CHIP_RESET (DTR/RTS hardware reset)
+- **Boot mode (`boot:`)**: `0x23` or `0x03` = DOWNLOAD mode (GPIO probe succeeded),
+  `0x28` or `0x29` = SPI_FAST_FLASH_BOOT (normal boot)
+
+#### Caveats
+
+1. **Firmware crash loops** produce continuous `rst:0xc` resets that can mask a
+   GPIO-triggered reset.  For reliable probing, first erase flash
+   (`esptool.py erase_flash`) so the board sits idle in bootloader, or flash
+   known-good firmware that boots cleanly.
+2. **Dual-USB hub boards** always respond to USB DTR/RTS on the JTAG slot.
+   The GPIO probe will show no effect on these boards (GPIOs not connected
+   to the onboard auto-download circuit).
+3. The probe only needs to be run once per physical board — the result is
+   stable and can be cached in the slot configuration.
+
 ---
 
 ## 7. Test Cases

@@ -50,10 +50,10 @@ Response fields per slot: `label`, `state`, `url` (RFC2217), `present`, `running
 
 Count how many slots show `present: true`. Then determine the type:
 
-| Present slots | Board type | GPIO reset needed? | How to identify |
-|---------------|------------|-------------------|-----------------|
-| 1 slot | **Single-USB** | Yes — wire Pi GPIO 17→EN, GPIO 18→BOOT | One `ttyACM`/`ttyUSB` device; same slot for flash + monitor |
-| 2 slots (same hub parent) | **Dual-USB hub board** | No — onboard auto-download circuit | Two `ttyACM` devices under a common USB hub path |
+| Present slots | Board type | Reset method | How to identify |
+|---------------|------------|-------------|-----------------|
+| 1 slot | **Single-USB** | Run GPIO probe (see esp32-tester-gpio) to check if Pi GPIOs are wired to EN/BOOT. If not, use DTR/RTS via serial reset. | One `ttyACM`/`ttyUSB` device; same slot for flash + monitor |
+| 2 slots (same hub parent) | **Dual-USB hub board** | DTR/RTS on JTAG slot — onboard auto-download circuit, no GPIO needed | Two `ttyACM` devices under a common USB hub path |
 
 **For dual-USB boards**, you must identify which slot is which:
 
@@ -72,7 +72,7 @@ ssh pi@192.168.0.87 "udevadm info -q property /dev/ttyACM0 | grep ID_SERIAL"
 | **Serial monitor** | The one slot | UART slot |
 | **Reset (DTR/RTS)** | The one slot (or Pi GPIO) | JTAG slot (auto-download circuit) |
 | **Boot output after reset** | The one slot | UART slot (NOT the JTAG slot!) |
-| **GPIO control needed?** | Yes (EN + BOOT pins) | No (handled by JTAG DTR/RTS) |
+| **GPIO control needed?** | Run GPIO probe to detect (see esp32-tester-gpio) | No (handled by JTAG DTR/RTS) |
 
 ## Serial Reset
 
