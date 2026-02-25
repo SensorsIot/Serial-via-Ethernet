@@ -490,7 +490,7 @@ requiring SSH access to the Pi.
 **Error:** Returns `{"ok": false, "error": "..."}` if slot not found, device
 not present, or serial open fails.
 
-**Used by:** enter-portal (§4), flapping recovery (FR-007), integration tests
+**Used by:** flapping recovery (FR-007), integration tests
 
 ### FR-009 — Serial Monitor
 
@@ -525,7 +525,7 @@ Uses the RFC2217 proxy (non-exclusive) so the proxy stays running.
 {"ok": true, "matched": false, "line": null, "output": ["line1", "line2"]}
 ```
 
-**Used by:** enter-portal (§4), flapping recovery (FR-007), test verification
+**Used by:** flapping recovery (FR-007), test verification
 
 ### FR-007 — USB Flap Detection
 
@@ -627,35 +627,38 @@ serial-interface mode.
 | GET | /api/test/progress | Poll current test session state (FR-019) |
 | **Composite** | | |
 | GET | /api/log | Activity log (timestamped entries, filterable with `?since=`) |
-| POST | /api/enter-portal | Trigger DUT captive portal via serial reset/monitor sequence |
+| POST | /api/enter-portal | Connect to DUT's captive portal SoftAP, submit WiFi credentials, then start local AP |
 
 #### Enter-Portal Composite Operation
 
-`POST /api/enter-portal` is a composite operation built on serial reset
-(FR-008) and serial monitor (FR-009).  It forces a DUT into captive portal
-mode by performing rapid reboots until the boot counter exceeds the portal
-threshold.
+`POST /api/enter-portal` is a composite operation that connects to a DUT's
+captive portal SoftAP, submits WiFi credentials to provision it, then starts
+a local AP with those same credentials for the DUT to connect back to.
 
 **Request body:**
 ```json
-{"slot": "SLOT2"}
+{"portal_ssid": "iOS-Keyboard-Setup", "ssid": "MyNetwork", "password": "secret123"}
 ```
 
-**Procedure (runs in background thread):**
-1. `serial.reset(slot)` — clean boot the device
-2. `serial.monitor(slot, "Boot count reset to 0")` — confirm NVS was reset
-   or normal boot
-3. Loop N times (N = portal threshold, typically 3):
-   a. `serial.reset(slot)` — reboot
-   b. `serial.monitor(slot, "Boot count:")` — confirm boot count incremented
-4. `serial.monitor(slot, "PORTAL mode")` — confirm device entered captive
-   portal mode
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `portal_ssid` | No | `"iOS-Keyboard-Setup"` | The device's SoftAP name to connect to |
+| `ssid` | Yes | — | WiFi SSID to provision on the device |
+| `password` | No | — | WiFi password to provision on the device |
+
+**Procedure:**
+1. Join the DUT's captive portal SoftAP (`portal_ssid`) as a WiFi station
+2. `POST` the WiFi credentials (`ssid`, `password`) to `http://192.168.4.1/connect`
+   on the DUT's built-in provisioning endpoint
+3. Disconnect from the DUT's SoftAP
+4. Start a local AP with the provisioned `ssid` and `password` so the DUT
+   can connect back to the Pi after it reboots onto the new network
 
 Each step is logged to the activity log.  Progress is observable via
 `GET /api/log?since=<ts>`.
 
-**Response:** `{"ok": true}` (operation runs asynchronously; monitor log for
-progress)
+**Response:** `{"ok": true}` on success; `{"ok": false, "error": "..."}` on
+failure (e.g., unable to join SoftAP, credential submission failed)
 
 ### FR-011 — AP Mode
 
@@ -845,8 +848,9 @@ Pins that have been released (value `"z"`) do not appear in the response.
 
 #### 18.3 Captive Portal via GPIO
 
-GPIO control provides a deterministic alternative to the rapid-reset approach
-(`POST /api/enter-portal`) for triggering captive portal mode:
+GPIO control provides an alternative approach to triggering captive portal
+mode on the DUT (complementary to `POST /api/enter-portal` which handles
+the WiFi provisioning flow after the device is already in portal mode):
 
 1. `POST /api/gpio/set` `{"pin": 18, "value": 0}` — hold DUT boot pin (GPIO0/GPIO9) LOW
 2. `POST /api/gpio/set` `{"pin": 17, "value": 0}` — pull DUT EN/RST LOW (reset)
@@ -1209,8 +1213,8 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
   hotplug events, WiFi tester operations (sta_join, sta_leave, scan, HTTP
   relay), and enter-portal sequence steps.  Entries are categorised (info,
   ok, error, step) with colour coding.  "Enter Captive Portal" button
-  triggers `POST /api/enter-portal` to run rapid-reset sequence on a
-  selected slot.  "Clear" button resets the display.  Log is polled every
+  triggers `POST /api/enter-portal` to connect to a DUT's captive portal
+  SoftAP and submit WiFi credentials.  "Clear" button resets the display.  Log is polled every
   2 seconds via `GET /api/log?since=<last_ts>`.
 - **Human interaction modal** — full-screen dark overlay with pulsing orange
   border, shown when a test script posts a human interaction request.

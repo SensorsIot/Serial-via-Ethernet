@@ -345,7 +345,7 @@ curl -X POST http://192.168.0.87:8080/api/ble/disconnect
 | POST | `/api/stop` | Manually stop proxy for a slot |
 | POST | `/api/serial/reset` | Reset device via DTR/RTS |
 | POST | `/api/serial/monitor` | Read serial output with pattern match |
-| POST | `/api/enter-portal` | Trigger DUT captive portal via rapid-reset sequence |
+| POST | `/api/enter-portal` | Connect to DUT's captive portal SoftAP, submit WiFi creds, start local AP `{"portal_ssid?", "ssid", "password?"}` |
 
 ### WiFi
 
