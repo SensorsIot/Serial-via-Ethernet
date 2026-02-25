@@ -1033,6 +1033,39 @@ wt.firmware_delete("ios-keyboard", "ios-keyboard.bin")
 # ESP32 OTA URL: http://192.168.0.87:8080/firmware/ios-keyboard/ios-keyboard.bin
 ```
 
+**End-to-end OTA workflow:**
+
+The tester supports a complete remote OTA workflow for ESP32 devices
+connected to its WiFi AP.  The HTTP relay (`POST /api/wifi/http`) bridges
+the LAN and WiFi AP networks, allowing OTA to be triggered from any
+client on the LAN.
+
+1. **Upload firmware** to the tester's OTA repository:
+   ```
+   POST /api/firmware/upload  (multipart: project=ios-keyboard, file=ios-keyboard.bin)
+   ```
+2. **Verify** the firmware is downloadable at the serving URL:
+   ```
+   GET /firmware/ios-keyboard/ios-keyboard.bin
+   ```
+3. **Trigger OTA** on the ESP32 via the HTTP relay:
+   ```
+   POST /api/wifi/http  {"method":"POST", "url":"http://192.168.4.15/ota"}
+   ```
+   The ESP32 must expose a `POST /ota` endpoint that calls `esp_ota_ops`
+   to download from `http://192.168.0.87:8080/firmware/<project>/<file>.bin`.
+4. **Monitor progress** via UDP logs:
+   ```
+   GET /api/udplog?source=192.168.4.15
+   ```
+   The ESP32 logs OTA progress (download bytes, partition writes, reboot)
+   which the tester captures on UDP port 5555.
+
+**Prerequisites for the ESP32 device:**
+- Connected to the tester's WiFi AP (via `POST /api/enter-portal` or manual provisioning)
+- HTTP server running with a `POST /ota` trigger endpoint
+- OTA URL configured to point at the tester's firmware repository
+
 **Implementation notes:**
 - Path traversal protection: reject `..` in both project and filename
 - Directory auto-creation: project subdirectory created on first upload

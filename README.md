@@ -274,6 +274,37 @@ ut.test_result("TC-001", "WiFi Connect", "PASS")
 ut.test_end()
 ```
 
+### OTA Firmware Update Workflow
+
+The tester provides a complete end-to-end OTA workflow for ESP32 devices connected via its WiFi AP:
+
+```bash
+# 1. Upload firmware to the tester's OTA repository
+curl -X POST http://192.168.0.87:8080/api/firmware/upload \
+  -F "project=ios-keyboard" -F "file=@build/ios-keyboard.bin"
+
+# 2. Verify the firmware is downloadable
+#    (ESP32 will fetch from this URL during OTA)
+curl -o /dev/null -w "%{http_code}" \
+  http://192.168.0.87:8080/firmware/ios-keyboard/ios-keyboard.bin
+
+# 3. Trigger OTA on the ESP32 via HTTP relay
+#    (the ESP32 must expose a /ota endpoint and be connected to the tester's AP)
+curl -X POST http://192.168.0.87:8080/api/wifi/http \
+  -H "Content-Type: application/json" \
+  -d '{"method":"POST","url":"http://192.168.4.15/ota"}'
+
+# 4. Monitor progress via UDP logs
+curl http://192.168.0.87:8080/api/udplog?source=192.168.4.15
+```
+
+The ESP32 device must:
+- Be connected to the tester's WiFi AP (e.g. via `POST /api/enter-portal`)
+- Have an HTTP server with a `POST /ota` endpoint that triggers `esp_ota_ops`
+- Configure its OTA URL to `http://192.168.0.87:8080/firmware/<project>/<file>.bin`
+
+The tester's HTTP relay (`POST /api/wifi/http`) bridges the gap between the LAN network and the WiFi AP network, allowing remote triggering of OTA from any client on the LAN.
+
 ### curl Examples
 
 ```bash
