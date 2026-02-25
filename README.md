@@ -466,6 +466,40 @@ docs/
 
 ---
 
+## Claude Code Skills
+
+The tester comes with Claude Code skills that let an AI agent operate the tester via curl. Each skill covers one domain and includes endpoints, curl examples, prerequisites, and troubleshooting.
+
+### Installing Skills
+
+Copy the skills into your project's `.claude/skills/` directory so Claude Code can use them:
+
+```bash
+# From your ESP32 project root
+mkdir -p .claude/skills
+git clone https://github.com/SensorsIot/Universal-ESP32-Tester.git /tmp/esp32-tester
+cp -r /tmp/esp32-tester/.claude/skills/esp32-tester-* .claude/skills/
+rm -rf /tmp/esp32-tester
+```
+
+### After Installing: Enhance Your FSD
+
+The `esp32-tester-fsd-writer` skill is a procedure that reads your project's FSD and adds a testing chapter — how to verify each feature using the tester, with exact curl commands and success criteria. Ask Claude: *"enhance the FSD with tester integration"*.
+
+### Available Skills
+
+| Skill | Triggers on | Purpose |
+|-------|-------------|---------|
+| `esp32-tester-serial` | serial, reset, monitor, flash, esptool | Device discovery, serial reset/monitor, RFC2217 flashing |
+| `esp32-tester-wifi` | wifi, AP, station, scan, provision | WiFi AP/STA, HTTP relay, captive portal provisioning |
+| `esp32-tester-ota` | OTA, firmware, upload, update | Firmware upload/list/delete, OTA update workflow |
+| `esp32-tester-ble` | BLE, bluetooth, GATT, NUS | BLE scan, connect, GATT write |
+| `esp32-tester-gpio` | GPIO, pin, boot mode, button | Drive Pi GPIO pins for boot mode control |
+| `esp32-tester-udplog` | UDP log, debug log, remote log | Retrieve/clear UDP debug logs, activity log |
+| `esp32-tester-fsd-writer` | FSD, enhance FSD, add testing | Reads your FSD and adds a testing chapter with tester procedures |
+
+---
+
 ## License
 
 MIT
