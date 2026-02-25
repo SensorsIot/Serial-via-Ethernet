@@ -1404,15 +1404,24 @@ using a two-step probe:
 
 #### Probe Algorithm
 
+**CRITICAL:** Always release EN and BOOT by driving HIGH (`1`), never directly
+to hi-Z (`"z"`).  Floating GPIO lines connected to ESP32 EN/BOOT can crash the
+Pi's dwc_otg USB controller.  Only switch to hi-Z after pins are stable HIGH.
+
 ```
 Step 1: Try GPIO-based download mode entry
   1a. Drive Pi GPIO18 LOW (BOOT pin)
-  1b. Pulse Pi GPIO17 LOW then HIGH (EN/RST pin)
-  1c. Release Pi GPIO18 to hi-Z
-  1d. Monitor slot serial output for 3 seconds
-  1e. Check boot mode in output:
-      - "DOWNLOAD" in boot mode string → GPIO controls this board ✓
-      - No output or normal boot mode → GPIO has no effect, go to Step 2
+  1b. Wait 1 second (let pin settle)
+  1c. Drive Pi GPIO17 LOW (EN/RST — assert reset)
+  1d. Wait 200ms
+  1e. Drive Pi GPIO17 HIGH (release reset — ESP32 samples BOOT pin now)
+  1f. Wait 500ms
+  1g. Drive Pi GPIO18 HIGH (release BOOT)
+  1h. (Optional) Set GPIO17 and GPIO18 to hi-Z once stable
+  1i. Monitor slot serial output for 3 seconds
+  1j. Check for USB disconnect/reconnect in dmesg or boot mode in serial:
+      - USB re-enumeration or "DOWNLOAD" boot mode → GPIO controls this board ✓
+      - No USB event and no output → GPIO has no effect, go to Step 2
 
 Step 2: Try USB DTR/RTS reset (fallback)
   2a. POST /api/serial/reset on the slot
@@ -1439,14 +1448,18 @@ Step 2: Try USB DTR/RTS reset (fallback)
 
 #### Caveats
 
-1. **Firmware crash loops** produce continuous `rst:0xc` resets that can mask a
+1. **Never release EN/BOOT to hi-Z directly.**  The Pi Zero W's dwc_otg USB
+   controller is sensitive to floating GPIO lines connected to ESP32 EN/BOOT.
+   Releasing directly to hi-Z (`"z"`) can crash or hang the Pi.  Always drive
+   HIGH (`1`) first to release, then optionally switch to hi-Z once stable.
+2. **Firmware crash loops** produce continuous `rst:0xc` resets that can mask a
    GPIO-triggered reset.  For reliable probing, first erase flash
    (`esptool.py erase_flash`) so the board sits idle in bootloader, or flash
    known-good firmware that boots cleanly.
-2. **Dual-USB hub boards** always respond to USB DTR/RTS on the JTAG slot.
+3. **Dual-USB hub boards** always respond to USB DTR/RTS on the JTAG slot.
    The GPIO probe will show no effect on these boards (GPIOs not connected
    to the onboard auto-download circuit).
-3. The probe only needs to be run once per physical board — the result is
+4. The probe only needs to be run once per physical board — the result is
    stable and can be cached in the slot configuration.
 
 ---
