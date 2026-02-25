@@ -1,106 +1,162 @@
 # Universal ESP32 Tester
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi-red.svg)](https://www.raspberrypi.org/)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
-[![ESP32](https://img.shields.io/badge/Devices-ESP32%20%7C%20Arduino-brightgreen.svg)](https://www.espressif.com/)
-[![pytest](https://img.shields.io/badge/Testing-pytest-orange.svg)](https://pytest.org/)
-
-## 🎯 The Problem
-
-Testing ESP32 firmware is a manual nightmare. You flash over a cable, press physical buttons to trigger modes, stare at a serial monitor to see what happened, and restart everything between tests. Automated testing of WiFi, captive portals, MQTT, and GPIO interactions seems impossible — each one requires hands-on intervention.
-
-Meanwhile, if your ESP32s are plugged into a Proxmox host, only one VM can access each USB controller — you can't split devices across containers.
-
-## 💡 The Solution
-
-Turn a **$15 Raspberry Pi Zero W** into a complete ESP32 test instrument. The Pi shares serial ports over the network, runs a WiFi access point for the device under test, relays HTTP to devices on its network, controls GPIO pins to simulate button presses, and provides a real-time test progress panel — all through a single HTTP API.
-
-From a pytest script, you can flash firmware, trigger captive portal mode, provision WiFi credentials, verify MQTT connections, and check REST APIs — with zero human interaction:
-
-```python
-ut = ESP32TesterDriver("http://192.168.0.87:8080")
-
-# Reset DUT, start test AP, wait for it to connect
-ut.serial_reset("SLOT2")
-ut.ap_start("TestAP", "password123")
-station = ut.wait_for_station(timeout=30)
-
-# Talk to the DUT through the Pi's radio
-resp = ut.http_get(f"http://{station['ip']}/api/status")
-assert resp.json()["wifi_connected"] is True
-```
-
-## 📋 What It Does
-
-- **Share serial ports** — plug in any USB serial device (ESP32, Arduino, etc.) and it's available over the network via RFC2217 on a fixed TCP port
-- **Flash firmware remotely** — works with esptool, PlatformIO, and ESP-IDF over the network
-- **Run a WiFi test AP** — start/stop a SoftAP on the Pi's radio, DUTs connect to it for isolated testing
-- **Relay HTTP to DUTs** — proxy HTTP requests through the Pi's radio to devices on its AP network
-- **Control GPIO pins** — drive Pi GPIO pins to simulate button presses on the DUT (e.g., trigger captive portal mode without touching hardware)
-- **Reset and monitor serial** — reset DUTs via DTR/RTS and watch serial output for specific patterns
-- **Scan WiFi networks** — see what's broadcasting, verify DUT AP is visible
-- **Join DUT networks** — connect to a DUT's captive portal AP as a station to test provisioning flows
-- **Track test progress** — real-time panel on the web UI showing which test is running, what step it's on, pass/fail results
-- **Request human interaction** — block a test until an operator confirms a physical action (cable swap, power cycle)
-- **Web portal** at port 8080 — see connected devices, WiFi status, test progress, copy connection URLs
-- **pytest driver included** — `WiFiTesterDriver` class with methods for every capability
-- One client per serial device at a time (RFC2217 protocol limitation)
-- Slot-based identity — TCP ports are tied to physical USB connectors, not devices. Swap boards freely.
+A Raspberry Pi that turns into a complete remote test instrument for ESP32 devices. Plug your boards into its USB hub, and control everything — serial, WiFi, BLE, GPIO, firmware updates — over the network through a single HTTP API.
 
 ---
 
-## 📡 How It Works
+## Services
 
+### 1. Remote Serial (RFC2217)
+
+Each USB port on the Pi's hub gets a **fixed TCP port**. Plug an ESP32 into port 1 and it's always reachable at `rfc2217://pi:4001`, regardless of what `/dev/ttyUSB*` name Linux assigns. Swap boards freely — the port follows the physical connector, not the device.
+
+Works with esptool, PlatformIO, ESP-IDF, and any pyserial-based tool. One client at a time per device.
+
+**What happens on plug/unplug:** udev detects the event, notifies the portal, and the RFC2217 proxy starts or stops automatically. No manual intervention needed.
+
+**ESP32 reset behavior:** The Pi can reset devices via DTR/RTS signals over the serial connection. This works differently depending on the chip:
+
+| Chip | USB Interface | Device Node | Reset Method | Caveat |
+|------|--------------|-------------|--------------|--------|
+| ESP32, ESP32-S2 | External UART bridge (CP2102, CH340) | `/dev/ttyUSB*` | DTR/RTS toggle | Reliable, no issues |
+| ESP32-C3, ESP32-S3 | Native USB-Serial/JTAG | `/dev/ttyACM*` | DTR/RTS toggle | Linux asserts DTR+RTS on port open, which puts the chip into **download mode** during early boot. The Pi adds a 2-second delay before opening the port to avoid this. |
+
+**Download mode vs normal boot:** ESP32 chips use GPIO0 (active LOW) to select boot mode. If GPIO0 is held LOW during reset, the chip enters download mode (for flashing). In normal operation GPIO0 has an internal pull-up, so the chip boots normally. The UART bridge chips (CP2102) use a capacitor-based circuit to pulse GPIO0 only during the esptool handshake — this is transparent to the user.
+
+### 2. WiFi Test Instrument
+
+The Pi's **wlan0** radio acts as a programmable WiFi access point or station, isolated from the wired LAN on eth0.
+
+- **AP mode** — start a SoftAP with any SSID/password. DUTs connect to `192.168.4.x`, Pi is at `192.168.4.1`. DHCP and DNS included.
+- **STA mode** — join a DUT's captive portal AP as a station to test provisioning flows.
+- **HTTP relay** — proxy HTTP requests through the Pi's radio to devices on its WiFi network.
+- **Scan** — list nearby WiFi networks to verify a DUT's AP is broadcasting.
+
+AP and STA are mutually exclusive — starting one stops the other.
+
+### 3. GPIO Control
+
+Drive Pi GPIO pins from test scripts to simulate button presses on the DUT. The most common use: **hold a pin LOW during reset** to force the DUT into a specific boot mode (captive portal, factory reset, etc.).
+
+**Allowed pins (BCM numbering):** 5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
+
+**Important:** Always release pins when done by setting them to `"z"` (high-impedance input). A pin left driven LOW will prevent the DUT from booting normally.
+
+**Standard wiring:**
+
+| Pi GPIO (BCM) | Pin # | DUT Pin | Function |
+|---------------|-------|---------|----------|
+| 17 | 11 | EN/RST | Hardware reset (active LOW) |
+| 18 | 12 | GPIO0 (ESP32) / GPIO9 (ESP32-C3) | Boot mode select (active LOW → download mode) |
+| 27 | 13 | — | Spare 1 |
+| 22 | 15 | — | Spare 2 |
+
+**GPIO0 vs GPIO9:** Classic ESP32 uses GPIO0 for boot mode selection. ESP32-C3/S3 with native USB use GPIO9 instead. Both are active LOW — hold LOW during reset to enter download/portal mode.
+
+Example — trigger captive portal mode without touching the board:
 ```
-                                           Proxmox / Dev Machine
-                                          ┌────────────────────────────────┐
-┌────────────────────────┐                │  ┌──────────────────────────┐  │
-│ Raspberry Pi Zero W    │                │  │ Container / VM           │  │
-│ 192.168.0.87           │    eth0        │  │                          │  │
-│                        │◄───────────────┼──│  rfc2217://:4001 (serial)│  │
-│ ┌────────────────────┐ │                │  │  HTTP API :8080 (control)│  │
-│ │ USB Hub            │ │                │  │  pytest + driver         │  │
-│ │  SLOT1 ─── :4001   │ │                │  └──────────────────────────┘  │
-│ │  SLOT2 ─── :4002   │ │                └────────────────────────────────┘
-│ │  SLOT3 ─── :4003   │ │
-│ └────────────────────┘ │
-│                        │
-│ ┌────────────────────┐ │    WiFi (192.168.4.x)
-│ │ wlan0 Radio        │ │◄ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-│ │  AP: 192.168.4.1   │ │                    ┌──────┴───────┐
-│ │  STA / Scan        │ │                    │  ESP32 DUT   │
-│ │  HTTP Relay        │ │                    │  192.168.4.x │
-│ └────────────────────┘ │                    └──────────────┘
-│                        │
-│ ┌────────────────────┐ │
-│ │ GPIO (BCM)         │ │ ── wire ──► DUT GPIO 2 (portal trigger)
-│ │  Pin 17 → DUT      │ │
-│ └────────────────────┘ │
-│                        │
-│ Web Portal ─── :8080   │
-└────────────────────────┘
+1. GPIO 18 → LOW          (hold DUT boot-select pin low)
+2. GPIO 17 → LOW, wait, → "z"   (pulse EN/RST to reset DUT)
+3. DUT boots with boot pin held low → enters captive portal
+4. GPIO 18 → "z"          (release immediately)
 ```
 
-The Pi serves three roles simultaneously:
+### 4. UDP Log Receiver
 
-1. **Serial proxy** — each USB slot gets a fixed TCP port via RFC2217. Plug/unplug is handled automatically by udev hotplug events.
-2. **WiFi test instrument** — the Pi's onboard wlan0 radio acts as a programmable AP or station. DUTs connect to the Pi's AP for isolated testing; the Pi relays HTTP to them.
-3. **GPIO controller** — Pi GPIO pins wired to DUT pins can simulate button presses during boot to trigger hardware-level behavior (captive portal, factory reset).
+Listens on **UDP port 5555** for debug log output from ESP32 devices. This is essential when the USB port is occupied (e.g., ESP32-S3 running as USB HID keyboard) and you can't use a serial monitor.
+
+The ESP32 firmware sends `ESP_LOG` output to the Pi's IP over UDP. Logs are buffered (last 2000 lines) and available via the HTTP API, filterable by source IP and timestamp.
+
+**ESP32 side** — point your UDP logging to `192.168.0.87:5555` (or whatever the Pi's IP is).
+
+### 5. OTA Firmware Repository
+
+Serves firmware binaries over HTTP so ESP32 devices can perform OTA updates from the local network. No internet or GitHub access required during development.
+
+Upload a `.bin` file to the Pi, then point the ESP32's OTA URL to:
+```
+http://192.168.0.87:8080/firmware/<project-name>/<filename>.bin
+```
+
+Firmware is stored in `/var/lib/rfc2217/firmware/` organized by project subdirectory.
+
+### 6. BLE Proxy
+
+Uses the Pi's **onboard Bluetooth radio** to scan for, connect to, and send raw bytes to BLE peripherals. The Pi acts as a dumb BLE-to-HTTP bridge — you send hex-encoded bytes via the API, and the Pi writes them to the specified GATT characteristic.
+
+This enables remote control of BLE devices from test scripts or AI agents. For example, sending keystrokes to an ESP32 running as a BLE-USB keyboard, or triggering OTA updates via BLE command.
+
+**Limitation:** One BLE connection at a time (single radio).
+
+**Prerequisite:** Bluetooth must be powered on:
+```bash
+sudo rfkill unblock bluetooth
+sudo hciconfig hci0 up
+sudo bluetoothctl power on
+```
+
+### 7. Test Automation
+
+Two additional services support automated test workflows:
+
+- **Test progress tracking** — push live test session updates (start, step, result, end) to the web portal. Operators see a real-time progress panel without needing a terminal.
+- **Human interaction requests** — block a test script until an operator confirms a physical action (cable swap, power cycle, antenna repositioning). The web portal shows a modal with the instruction and Done/Cancel buttons.
+
+### 8. Web Portal
+
+A browser-based dashboard at **http://pi-ip:8080** showing:
+- Serial slot status (running/empty/flapping)
+- WiFi AP/STA state and connected stations
+- Activity log with color-coded entries
+- Test progress panel
+- Human interaction modal
 
 ---
 
-## ⚡ Installation & Usage
+## Hardware Setup
 
-### Prerequisites
+### What You Need
 
-- Raspberry Pi (Zero W, 3, 4, or 5) with Raspberry Pi OS
-- USB Ethernet adapter (eth0 for wired LAN — wlan0 is reserved for testing)
-- USB hub (if more than one device)
-- Python 3.9+
+| Component | Purpose |
+|-----------|---------|
+| **Raspberry Pi** (Zero W, 3, 4, or 5) | Runs the portal. Needs onboard WiFi + Bluetooth. |
+| **USB Ethernet adapter** | Wired LAN on eth0 (wlan0 is reserved for WiFi testing) |
+| **USB hub** | Connect multiple ESP32 boards (if needed) |
+| **Jumper wires** (optional) | Pi GPIO → DUT GPIO for automated boot mode control |
 
-### 🚀 Quick Start
+### Network Topology
+
+```
+ LAN (192.168.0.x)
+       |
+       | eth0 (wired)
+       v
+  Raspberry Pi ---- wlan0 (WiFi test AP: 192.168.4.x)
+  192.168.0.87      hci0  (Bluetooth LE)
+       |             UDP :5555 (log receiver)
+       | USB hub
+       |
+  +----+----+----+
+  |    |    |    |
+ :4001 :4002 :4003
+ SLOT1 SLOT2 SLOT3
+```
+
+eth0 carries all management traffic (HTTP API, RFC2217 serial). wlan0 is dedicated to WiFi testing. They never overlap.
+
+### Network Ports
+
+| Port | Protocol | Direction | Purpose |
+|------|----------|-----------|---------|
+| 8080 | TCP/HTTP | Clients → Pi | Web portal, REST API, firmware downloads |
+| 4001+ | TCP/RFC2217 | Clients → Pi | Serial connections (one per USB slot) |
+| 5555 | UDP | ESP32 → Pi | Debug log receiver |
+
+---
+
+## Quick Start
+
+### Installation
 
 ```bash
 git clone https://github.com/SensorsIot/Universal-ESP32-Tester.git
@@ -108,21 +164,21 @@ cd Universal-ESP32-Tester/pi
 bash install.sh
 ```
 
-After installation, discover your USB port slots:
+This installs all dependencies (pyserial, hostapd, dnsmasq, bleak, esptool), copies scripts to `/usr/local/bin/`, creates the firmware directory, and starts the portal as a systemd service.
+
+### Slot Configuration
+
+Discover which USB connector maps to which slot key:
 
 ```bash
-rfc2217-learn-slots
+rfc2217-learn-slots     # Plug in one device at a time
 ```
 
-Review and edit the slot configuration:
+Edit the configuration:
 
 ```bash
 sudo nano /etc/rfc2217/slots.json
 ```
-
-### 🔧 Configuration
-
-Slot configuration maps physical USB ports to TCP ports in `/etc/rfc2217/slots.json`:
 
 ```json
 {
@@ -133,53 +189,39 @@ Slot configuration maps physical USB ports to TCP ports in `/etc/rfc2217/slots.j
 }
 ```
 
-Use `rfc2217-learn-slots` to discover the `slot_key` values — plug each device in one at a time and run the tool.
+Restart after editing: `sudo systemctl restart rfc2217-portal`
 
-### 🖥️ Web Portal
+---
 
-Open **http://192.168.0.87:8080** in your browser to see:
+## Usage
 
-- Connected devices and their serial slot status
-- WiFi AP/STA state and connected stations
-- Test progress panel (current test, step, pass/fail counts)
-- Copy-paste connection URLs
+### Serial: Flash & Monitor
 
-### 🔌 Serial: Flashing & Monitoring
+```bash
+# esptool
+esptool --port "rfc2217://192.168.0.87:4001?ign_set_control" write_flash 0x0 firmware.bin
 
-**Python with pyserial:**
-```python
+# ESP-IDF
+export ESPPORT="rfc2217://192.168.0.87:4001?ign_set_control"
+idf.py flash monitor
+
+# Python
 import serial
 ser = serial.serial_for_url("rfc2217://192.168.0.87:4001?ign_set_control", baudrate=115200)
-print(ser.readline())
 ```
 
-**esptool:**
-```bash
-esptool --port "rfc2217://192.168.0.87:4001?ign_set_control" write_flash 0x0 firmware.bin
-```
-
-**PlatformIO:**
 ```ini
+# PlatformIO (platformio.ini)
 [env:esp32]
 upload_port = rfc2217://192.168.0.87:4001?ign_set_control
 monitor_port = rfc2217://192.168.0.87:4001?ign_set_control
 ```
 
-**ESP-IDF:**
-```bash
-export ESPPORT="rfc2217://192.168.0.87:4001?ign_set_control"
-idf.py flash monitor
-```
-
-### 🧪 pytest Integration
-
-Install the driver from this repo:
+### pytest Driver
 
 ```bash
 pip install -e Universal-ESP32-Tester/pytest
 ```
-
-Use it in your tests:
 
 ```python
 from wifi_tester_driver import WiFiTesterDriver as ESP32TesterDriver
@@ -187,170 +229,212 @@ from wifi_tester_driver import WiFiTesterDriver as ESP32TesterDriver
 ut = ESP32TesterDriver("http://192.168.0.87:8080")
 
 # Serial
-ut.serial_reset("SLOT2")                              # Reset DUT via DTR/RTS
+ut.serial_reset("SLOT2")
 result = ut.serial_monitor("SLOT2", pattern="WiFi connected", timeout=30)
 
-# WiFi AP
-ut.ap_start("TestAP", "password123")                  # Start test AP
-station = ut.wait_for_station(timeout=30)              # Wait for DUT to connect
-ut.ap_stop()                                           # Stop AP
-
-# HTTP relay (talk to DUT through Pi's radio)
+# WiFi
+ut.ap_start("TestAP", "password123")
+station = ut.wait_for_station(timeout=30)
 resp = ut.http_get(f"http://{station['ip']}/api/status")
-assert resp.json()["wifi_connected"] is True
+ut.ap_stop()
 
-# GPIO (simulate button press during boot)
+# GPIO — trigger captive portal mode
 try:
-    ut.gpio_set(17, 0)                                 # Hold DUT pin LOW
-    ut.serial_reset("SLOT2")                           # Reset — DUT boots with pin held
+    ut.gpio_set(18, 0)                   # Hold DUT boot pin LOW
+    ut.gpio_set(17, 0)                   # Pull EN/RST LOW (reset)
+    time.sleep(0.1)
+    ut.gpio_set(17, "z")                 # Release reset — DUT boots into portal
 finally:
-    ut.gpio_set(17, "z")                               # Release to input
+    ut.gpio_set(18, "z")                 # Always release boot pin
 
-# Captive portal
-ut.sta_join("MODBUS-Proxy-Setup", timeout=15)          # Join DUT's portal AP
-resp = ut.http_get("http://192.168.4.1/")              # Access portal page
-ut.sta_leave()                                         # Disconnect
+# Join DUT's captive portal AP
+ut.sta_join("MyDevice-Setup", timeout=15)
+resp = ut.http_get("http://192.168.4.1/")
+ut.sta_leave()
 
-# WiFi scan
-networks = ut.scan()                                   # See nearby APs
+# UDP logs
+logs = ut.udplog(source="192.168.0.121")
+ut.udplog_clear()
 
-# Test progress panel
-ut.test_start(spec="my-test-spec v1.0", phase="Phase 1", total=10)
-ut.test_step("TC-100", "Startup", "Step 1: Check DUT reachable")
-ut.test_result("TC-100", "Startup", "PASS")
+# OTA firmware
+ut.firmware_upload("my-project", "build/firmware.bin")
+files = ut.firmware_list()
+# ESP32 OTA URL: http://192.168.0.87:8080/firmware/my-project/firmware.bin
+
+# BLE
+devices = ut.ble_scan(name_filter="iOS-Keyboard")
+ut.ble_connect(devices[0]["address"])
+ut.ble_write("6e400002-b5a3-f393-e0a9-e50e24dcca9e", b"\x02Hello")
+ut.ble_disconnect()
+
+# Test progress
+ut.test_start(spec="Firmware v2.1", phase="Integration", total=10)
+ut.test_step("TC-001", "WiFi Connect", "Joining AP...")
+ut.test_result("TC-001", "WiFi Connect", "PASS")
 ut.test_end()
 ```
 
-### 🔀 GPIO Wiring
+### curl Examples
 
-Wire Pi GPIO pins to DUT pins for automated hardware control:
+```bash
+# Serial reset
+curl -X POST http://192.168.0.87:8080/api/serial/reset \
+  -H "Content-Type: application/json" -d '{"slot":"SLOT1"}'
 
-| Pi GPIO (BCM) | DUT GPIO | Function | Active Level |
-|---------------|----------|----------|-------------|
-| 17 | 2 | Captive portal trigger | LOW |
+# Start WiFi AP
+curl -X POST http://192.168.0.87:8080/api/wifi/ap_start \
+  -H "Content-Type: application/json" -d '{"ssid":"TestAP","password":"secret"}'
 
-**Pin allowlist:** `{5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}`
+# GPIO: hold boot pin LOW, pulse reset, release
+curl -X POST http://192.168.0.87:8080/api/gpio/set \
+  -H "Content-Type: application/json" -d '{"pin":18,"value":0}'
+curl -X POST http://192.168.0.87:8080/api/gpio/set \
+  -H "Content-Type: application/json" -d '{"pin":17,"value":0}'
+sleep 0.1
+curl -X POST http://192.168.0.87:8080/api/gpio/set \
+  -H "Content-Type: application/json" -d '{"pin":17,"value":"z"}'
+curl -X POST http://192.168.0.87:8080/api/gpio/set \
+  -H "Content-Type: application/json" -d '{"pin":18,"value":"z"}'
 
-Always release pins after use: `ut.gpio_set(17, "z")`
+# Get UDP logs
+curl http://192.168.0.87:8080/api/udplog?source=192.168.0.121&limit=50
 
-### ❓ Troubleshooting
+# Upload firmware
+curl -X POST http://192.168.0.87:8080/api/firmware/upload \
+  -F "project=ios-keyboard" -F "file=@build/ios-keyboard.bin"
+
+# BLE: scan, connect, write, disconnect
+curl -X POST http://192.168.0.87:8080/api/ble/scan \
+  -H "Content-Type: application/json" -d '{"timeout":5,"name_filter":"iOS-Keyboard"}'
+curl -X POST http://192.168.0.87:8080/api/ble/connect \
+  -H "Content-Type: application/json" -d '{"address":"1C:DB:D4:84:58:CE"}'
+curl -X POST http://192.168.0.87:8080/api/ble/write \
+  -H "Content-Type: application/json" \
+  -d '{"characteristic":"6e400002-b5a3-f393-e0a9-e50e24dcca9e","data":"0248656c6c6f"}'
+curl -X POST http://192.168.0.87:8080/api/ble/disconnect
+```
+
+---
+
+## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Connection refused on serial port | Proxy not running | Check portal at :8080; verify device is plugged in |
-| Timeout during flash | Network latency | Use `esptool --no-stub` for reliability |
-| Port busy | Another client connected | Close the other connection first |
+| Timeout during flash | Network latency over RFC2217 | Use `esptool --no-stub` for reliability |
+| Port busy | Another client connected | Close the other connection first (RFC2217 = 1 client) |
 | ESP32-C3 stuck in download mode | DTR asserted on port open | Use `--after=watchdog-reset` with esptool, never `hard-reset` |
-| DUT not seen on AP | DUT has wrong credentials | Check DUT WiFi config, verify AP is running with `ut.ap_status()` |
-| Hotplug events not reaching portal | udev sandbox | Verify `systemd-run --no-block` in udev rules |
-| Device not detected | USB issue | Run `ls /dev/ttyUSB* /dev/ttyACM*` and `dmesg | tail` on the Pi |
+| DUT not connecting to AP | Wrong WiFi credentials in DUT | Verify AP is running: `curl .../api/wifi/ap_status` |
+| BLE scan finds nothing | Bluetooth powered off | `sudo rfkill unblock bluetooth && sudo hciconfig hci0 up && sudo bluetoothctl power on` |
+| No UDP logs appearing | ESP32 not sending to correct IP/port | Verify firmware log host is `192.168.0.87:5555` |
+| Firmware download returns 404 | Wrong path or not uploaded | Check `curl .../api/firmware/list` |
+| GPIO pin has no effect | Wrong BCM pin number or not wired | Verify wiring; only BCM pins in the allowlist work |
 
 ---
 
-## 🔧 Under the Hood
+## API Reference
 
-### 📡 API Endpoints
-
-**Serial:**
+### Serial
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/devices` | List all slots with status |
 | GET | `/api/info` | Pi IP, hostname, slot counts |
-| POST | `/api/hotplug` | Receive udev hotplug event |
+| POST | `/api/hotplug` | Receive udev hotplug event (internal) |
 | POST | `/api/start` | Manually start proxy for a slot |
 | POST | `/api/stop` | Manually stop proxy for a slot |
 | POST | `/api/serial/reset` | Reset device via DTR/RTS |
 | POST | `/api/serial/monitor` | Read serial output with pattern match |
-| POST | `/api/enter-portal` | Trigger DUT captive portal via serial reset sequence |
+| POST | `/api/enter-portal` | Trigger DUT captive portal via rapid-reset sequence |
 
-**WiFi:**
+### WiFi
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/wifi/ping` | Version and uptime |
-| GET | `/api/wifi/mode` | Current operating mode |
-| POST | `/api/wifi/mode` | Switch mode (wifi-testing / serial-interface) |
-| POST | `/api/wifi/ap_start` | Start SoftAP |
+| POST | `/api/wifi/ap_start` | Start SoftAP `{"ssid", "password?", "channel?"}` |
 | POST | `/api/wifi/ap_stop` | Stop SoftAP |
-| GET | `/api/wifi/ap_status` | AP status, SSID, stations |
-| POST | `/api/wifi/sta_join` | Join a WiFi network as station |
+| GET | `/api/wifi/ap_status` | AP status, SSID, connected stations |
+| POST | `/api/wifi/sta_join` | Join a WiFi network as station `{"ssid", "password?"}` |
 | POST | `/api/wifi/sta_leave` | Disconnect from WiFi network |
-| GET | `/api/wifi/scan` | Scan for WiFi networks |
-| POST | `/api/wifi/http` | HTTP relay through Pi's radio |
-| GET | `/api/wifi/events` | Event queue (long-poll) |
+| GET | `/api/wifi/scan` | Scan for nearby WiFi networks |
+| POST | `/api/wifi/http` | HTTP relay through Pi's radio `{"method", "url", "headers?", "body?"}` |
+| GET | `/api/wifi/events` | Event queue with long-poll `?timeout=` |
+| GET | `/api/wifi/mode` | Current operating mode |
+| POST | `/api/wifi/mode` | Switch mode `{"mode": "wifi-testing"|"serial-interface"}` |
 
-**GPIO / Test / Other:**
+### GPIO
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/gpio/set` | Drive GPIO pin low/high or release to input |
-| GET | `/api/gpio/status` | Read actively driven pin states |
+| POST | `/api/gpio/set` | Drive pin `{"pin": 17, "value": 0|1|"z"}` |
+| GET | `/api/gpio/status` | Read state of all actively driven pins |
+
+### UDP Log
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/udplog` | Get buffered log lines `?since=&source=&limit=` |
+| DELETE | `/api/udplog` | Clear the log buffer |
+
+### Firmware
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/firmware/<project>/<file>` | Download binary (used by ESP32 OTA client) |
+| GET | `/api/firmware/list` | List all available firmware files |
+| POST | `/api/firmware/upload` | Upload binary (multipart: `project` + `file`) |
+| DELETE | `/api/firmware/delete` | Delete a file `{"project", "filename"}` |
+
+### BLE
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/ble/scan` | Scan for peripherals `{"timeout?", "name_filter?"}` |
+| POST | `/api/ble/connect` | Connect by address `{"address"}` |
+| POST | `/api/ble/disconnect` | Disconnect current connection |
+| GET | `/api/ble/status` | Connection state (`idle` / `scanning` / `connected`) |
+| POST | `/api/ble/write` | Write hex bytes `{"characteristic", "data", "response?"}` |
+
+### Test / Other
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | POST | `/api/test/update` | Push test session start/step/result/end |
 | GET | `/api/test/progress` | Poll current test session state |
-| POST | `/api/human-interaction` | Block until operator confirms physical action |
-| GET | `/api/log` | Activity log (filterable with `?since=`) |
-
-### 📂 Files
-
-```
-pi/
-├── portal.py                     # Web portal + API + proxy supervisor
-├── wifi_controller.py            # WiFi instrument (AP, STA, scan, relay)
-├── plain_rfc2217_server.py       # RFC2217 server with DTR/RTS passthrough
-├── install.sh                    # Installer
-├── rfc2217-learn-slots           # Slot discovery tool
-├── c3_reset_test.py              # ESP32-C3 reset validation script
-├── config/
-│   └── slots.json                # Slot-to-port mapping
-├── scripts/
-│   ├── rfc2217-udev-notify.sh    # udev event forwarder
-│   └── wifi-lease-notify.sh      # dnsmasq DHCP lease callback
-├── udev/
-│   └── 99-rfc2217-hotplug.rules  # udev rules
-└── systemd/
-    └── rfc2217-portal.service    # systemd unit
-
-pytest/
-├── wifi_tester_driver.py         # Python test driver (WiFiTesterDriver class)
-├── conftest.py                   # pytest fixtures
-└── test_instrument.py            # Self-tests for the instrument
-
-docs/
-├── Serial-Portal-FSD.md          # Full functional specification
-└── WiFi-Tester-HTTP-Manual.md    # HTTP API manual
-
-skills/
-└── esp32-test-harness/SKILL.md   # Claude Code skill for test automation
-```
-
-### 🌐 Network Ports
-
-| Port | Direction | Purpose |
-|------|-----------|---------|
-| 8080 | Browser/API → Pi | Web portal and REST API |
-| 4001+ | Container/VM → Pi | RFC2217 serial connections (one per slot) |
-
-### 📻 WiFi Addressing
-
-| Mode | Pi Address | DUT Address | Subnet |
-|------|-----------|-------------|--------|
-| AP (Pi hosts network) | 192.168.4.1 | 192.168.4.2–20 (DHCP) | 192.168.4.0/24 |
-| STA (Pi joins DUT AP) | 192.168.4.x (DHCP) | 192.168.4.1 | DUT's subnet |
+| POST | `/api/human-interaction` | Block until operator confirms `{"message", "timeout?"}` |
+| GET | `/api/human/status` | Check if a human interaction is pending |
+| POST | `/api/human/done` | Confirm the pending interaction |
+| POST | `/api/human/cancel` | Cancel the pending interaction |
+| GET | `/api/log` | Activity log `?since=` |
 
 ---
 
-## 📚 Attributions & References
+## Project Structure
 
-- [RFC 2217](https://datatracker.ietf.org/doc/html/rfc2217) — Telnet Com Port Control Option
-- [pyserial](https://pyserial.readthedocs.io/) — Python serial port library with RFC2217 support
-- [esptool](https://github.com/espressif/esptool) — ESP32 flashing tool
-- [PlatformIO](https://platformio.org/) — Embedded development platform
-- [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) — Espressif IoT Development Framework
-- [hostapd](https://w1.fi/hostapd/) — WiFi AP daemon
-- [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html) — DHCP and DNS for the test AP
-- [gpiod](https://git.kernel.org/pub/scm/libs/libgpiod/libgpiod.git/) — Linux GPIO character device library
+```
+pi/
+  portal.py                  Main HTTP server, proxy supervisor, all API endpoints
+  wifi_controller.py         WiFi AP/STA/scan/relay backend
+  ble_controller.py          BLE scan/connect/write backend (bleak)
+  plain_rfc2217_server.py    RFC2217 serial proxy with DTR/RTS passthrough
+  install.sh                 One-command installer
+  rfc2217-learn-slots        Slot discovery helper
+  config/slots.json          USB slot → TCP port mapping
+  scripts/                   udev and dnsmasq callback scripts
+  udev/                      Hotplug rules
+  systemd/                   Service unit file
 
-## 📄 License
+pytest/
+  wifi_tester_driver.py      Python test driver (WiFiTesterDriver class)
+  conftest.py                Fixtures and CLI options
+  test_instrument.py         Self-tests for the instrument
 
-MIT License — feel free to use and modify.
+docs/
+  Serial-Portal-FSD.md       Full functional specification
+```
+
+---
+
+## License
+
+MIT

@@ -40,6 +40,23 @@ and reporting station events — all controlled over the same HTTP API.
 │  │  AP: 192.168.4.1  │  │
 │  │  STA / Scan       │  │
 │  └───────────────────┘  │
+│                         │                    ┌──────────────────┐
+│  ┌───────────────────┐  │                    │  ESP32 DUT       │
+│  │ BLE Proxy         │  │◄ ─ BLE (GATT) ─ ─ │  iOS-Keyboard    │
+│  │ hci0 (onboard)    │  │                    │  BLE peripheral  │
+│  │  Scan / Connect   │  │                    └──────────────────┘
+│  │  Write GATT chars │  │
+│  └───────────────────┘  │                    ┌──────────────────┐
+│                         │                    │  ESP32 DUT       │
+│  ┌───────────────────┐  │◄ ─ UDP :5555 ─ ─ ─│  debug logs      │
+│  │ UDP Log Receiver  │  │                    └──────────────────┘
+│  │  Port 5555        │  │
+│  └───────────────────┘  │
+│                         │
+│  ┌───────────────────┐  │
+│  │ Firmware Repo     │  │─── GET /firmware/<project>/<file>.bin
+│  │ /var/lib/.../fw   │  │
+│  └───────────────────┘  │
 │                         │
 │  Web Portal ────────────┼─ :8080
 └─────────────────────────┘
@@ -53,7 +70,7 @@ and reporting station events — all controlled over the same HTTP API.
 | USB Hub | 3-port hub connected to single USB port |
 | USB Ethernet adapter | eth0 — wired LAN for management and serial traffic |
 | Devices | ESP32, Arduino, or any USB serial device |
-| GPIO wiring | Pi GPIO 17 → DUT GPIO 2 (portal button, active LOW with internal pull-up) |
+| GPIO wiring | Pi GPIO 17 → DUT EN/RST (reset, active LOW); Pi GPIO 18 → DUT GPIO0/GPIO9 (boot select, active LOW); Pi GPIO 27 → Spare 1; Pi GPIO 22 → Spare 2 |
 
 ### 1.4 Operating Modes
 
@@ -78,8 +95,9 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| portal.py (rfc2217-portal) | /usr/local/bin/rfc2217-portal | Web UI, HTTP API, proxy supervisor, hotplug handler, WiFi API |
+| portal.py (rfc2217-portal) | /usr/local/bin/rfc2217-portal | Web UI, HTTP API, proxy supervisor, hotplug handler, WiFi API, BLE API, UDP log, firmware serving |
 | wifi_controller.py | /usr/local/bin/wifi_controller.py | WiFi instrument backend (AP, STA, scan, relay, events) |
+| ble_controller.py | /usr/local/bin/ble_controller.py | BLE proxy backend (scan, connect, write GATT characteristics via bleak) |
 | plain_rfc2217_server.py | /usr/local/bin/plain_rfc2217_server.py | RFC2217 server with direct DTR/RTS passthrough (all devices) |
 | ~~esp_rfc2217_server.py~~ | removed | Deprecated — breaks C3 native USB and classic ESP32 over RFC2217 |
 | ~~serial_proxy.py~~ | removed | Deprecated — replaced by plain_rfc2217_server.py |
@@ -830,22 +848,23 @@ Pins that have been released (value `"z"`) do not appear in the response.
 GPIO control provides a deterministic alternative to the rapid-reset approach
 (`POST /api/enter-portal`) for triggering captive portal mode:
 
-1. `POST /api/gpio/set` `{"pin": 17, "value": 0}` — drive DUT GPIO 2 low
-2. `POST /api/serial/reset` `{"slot": "SLOT1"}` — reset the DUT; it boots
-   with GPIO 2 held low and enters captive portal mode
-3. Verify captive portal from the serial output returned by step 2
-   (look for `CAPTIVE PORTAL MODE TRIGGERED` or `AP Started:`)
-4. `POST /api/gpio/set` `{"pin": 17, "value": "z"}` — release immediately
+1. `POST /api/gpio/set` `{"pin": 18, "value": 0}` — hold DUT boot pin (GPIO0/GPIO9) LOW
+2. `POST /api/gpio/set` `{"pin": 17, "value": 0}` — pull DUT EN/RST LOW (reset)
+3. Wait 100ms, then `POST /api/gpio/set` `{"pin": 17, "value": "z"}` — release reset; DUT boots into portal mode
+4. Verify captive portal from serial output (look for `CAPTIVE PORTAL MODE TRIGGERED` or `AP Started:`)
+5. `POST /api/gpio/set` `{"pin": 18, "value": "z"}` — release boot pin immediately
 
 The `ok: true` response from `/api/gpio/set` confirms the pin is driven —
 there is no need to poll `/api/gpio/status` to verify.
 
 **Driver methods:**
 ```python
-wt.gpio_set(17, 0)           # Drive DUT GPIO 2 low
-result = wt.serial_reset("SLOT1")  # Reset DUT — boots into portal mode
-# Check result["output"] for portal confirmation
-wt.gpio_set(17, "z")         # Release — ALWAYS do this when done
+wt.gpio_set(18, 0)           # Hold DUT boot pin (GPIO0/GPIO9) LOW
+wt.gpio_set(17, 0)           # Pull EN/RST LOW (reset)
+time.sleep(0.1)
+wt.gpio_set(17, "z")         # Release reset — DUT boots into portal mode
+# Check serial output for portal confirmation
+wt.gpio_set(18, "z")         # Release boot pin — ALWAYS do this when done
 ```
 
 ### FR-019 — Test Progress Tracking
@@ -874,6 +893,305 @@ wt.test_step("TC-001", "WiFi Connect", "Joining AP...", manual=False)
 wt.test_result("TC-001", "WiFi Connect", "PASS")
 wt.test_end()
 ```
+
+### FR-020 — UDP Log Receiver
+
+ESP32 devices send debug logs over UDP (since their USB port is often
+occupied by HID or other functions).  The Pi listens for these UDP log
+packets and makes them available through the HTTP API and web UI.
+
+**Configuration:**
+
+| Constant | Value |
+|----------|-------|
+| UDP_LOG_PORT | `5555` (env: `UDP_LOG_PORT`) |
+| UDP_LOG_MAX_LINES | `2000` |
+
+**Behaviour:**
+
+1. Portal spawns a background thread with a UDP socket bound to `0.0.0.0:5555`
+2. Each received datagram is decoded as UTF-8, split by newlines
+3. Lines are stored in a `collections.deque(maxlen=2000)` with timestamps
+   and source IP
+4. Lines are also forwarded to the activity log via `log_activity()`
+5. The UDP socket thread is daemon — it exits when the portal exits
+
+**Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/udplog | Retrieve buffered UDP log lines |
+| DELETE | /api/udplog | Clear the UDP log buffer |
+
+**GET /api/udplog** query parameters:
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| since | float | 0 | Only return lines with timestamp > since |
+| source | string | (all) | Filter by source IP address |
+| limit | int | 200 | Max lines to return |
+
+**Response:**
+```json
+{
+  "ok": true,
+  "lines": [
+    {"ts": 1740000000.123, "source": "192.168.0.121", "line": "I (12345) wifi_mgr: Connected"},
+    {"ts": 1740000000.456, "source": "192.168.0.121", "line": "I (12346) ble_nus: Client connected"}
+  ]
+}
+```
+
+**Driver methods:**
+```python
+logs = wt.udplog(since=0, source="192.168.0.121", limit=100)
+wt.udplog_clear()
+```
+
+**Implementation notes:**
+- Thread-safe: deque operations are atomic; timestamp+source stored per entry
+- Non-blocking: UDP recv in a loop with 1s timeout for clean shutdown
+- ESP32 remote_log.c sends to the configured host:port (default 192.168.0.87:5555)
+
+### FR-021 — OTA Firmware Repository
+
+The Pi serves firmware binaries over HTTP so ESP32 devices can perform
+OTA updates from the local network.  This eliminates the need for
+internet access or external hosting during development and testing.
+
+**Configuration:**
+
+| Constant | Value |
+|----------|-------|
+| FIRMWARE_DIR | `/var/lib/rfc2217/firmware` (env: `FIRMWARE_DIR`) |
+
+**Directory layout:**
+```
+/var/lib/rfc2217/firmware/
+├── ios-keyboard/
+│   └── ios-keyboard.bin
+├── modbus-proxy/
+│   └── modbus-proxy.bin
+└── ...
+```
+
+**Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /firmware/`<project>`/`<filename>` | Download firmware binary (used by ESP32 OTA) |
+| GET | /api/firmware/list | List all available firmware files |
+| POST | /api/firmware/upload | Upload a firmware binary |
+| DELETE | /api/firmware/delete | Delete a firmware file |
+
+**GET /firmware/`<project>`/`<filename>`**
+
+Serves the raw binary file with `Content-Type: application/octet-stream`.
+This is the URL the ESP32 OTA client points to, e.g.:
+```
+http://192.168.0.87:8080/firmware/ios-keyboard/ios-keyboard.bin
+```
+
+Path traversal is rejected (no `..` allowed in project or filename).
+
+**GET /api/firmware/list** response:
+```json
+{
+  "ok": true,
+  "files": [
+    {"project": "ios-keyboard", "filename": "ios-keyboard.bin", "size": 1048576, "modified": "2026-02-25T10:00:00+00:00"}
+  ]
+}
+```
+
+**POST /api/firmware/upload** body (multipart/form-data):
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| project | string | Yes | Project subdirectory name |
+| file | file | Yes | The firmware binary |
+
+**Response:**
+```json
+{"ok": true, "project": "ios-keyboard", "filename": "ios-keyboard.bin", "size": 1048576}
+```
+
+**DELETE /api/firmware/delete** body:
+```json
+{"project": "ios-keyboard", "filename": "ios-keyboard.bin"}
+```
+
+**Driver methods:**
+```python
+files = wt.firmware_list()
+wt.firmware_upload("ios-keyboard", "/path/to/ios-keyboard.bin")
+wt.firmware_delete("ios-keyboard", "ios-keyboard.bin")
+# ESP32 OTA URL: http://192.168.0.87:8080/firmware/ios-keyboard/ios-keyboard.bin
+```
+
+**Implementation notes:**
+- Path traversal protection: reject `..` in both project and filename
+- Directory auto-creation: project subdirectory created on first upload
+- install.sh creates `/var/lib/rfc2217/firmware` with appropriate permissions
+- Binary serving uses chunked reads (8 KB blocks) to avoid loading large
+  files into memory
+
+### FR-022 — BLE Proxy
+
+The Pi's onboard Bluetooth radio acts as a BLE Central (client) that can
+scan for, connect to, and send commands to BLE peripherals.  This enables
+remote control of BLE devices (e.g., sending keystrokes to an ESP32
+running the iOS-Keyboard firmware) from test scripts or AI agents via the
+HTTP API.
+
+The Pi is a **dumb BLE-to-HTTP bridge** — it handles only scan, connect,
+disconnect, status, and raw byte writes.  All higher-level protocol logic
+(command encoding, text diffing, chunking) is the responsibility of the
+caller.
+
+**Dependencies:**
+- `bleak>=0.20.0` (Python async BLE library, uses BlueZ on Linux)
+- BlueZ 5.43+ (standard on Raspberry Pi OS)
+
+**Configuration:**
+
+| Constant | Value |
+|----------|-------|
+| BLE_SCAN_TIMEOUT | `5.0` seconds (env: `BLE_SCAN_TIMEOUT`) |
+
+**State model:**
+
+| State | Description |
+|-------|-------------|
+| Idle | No BLE activity |
+| Scanning | Actively scanning for BLE peripherals |
+| Connected | Connected to a BLE peripheral |
+
+State transitions:
+
+| From | To | Trigger |
+|------|----|---------|
+| Idle | Scanning | `POST /api/ble/scan` |
+| Scanning | Idle | Scan completes (timeout) |
+| Idle | Connected | `POST /api/ble/connect` |
+| Connected | Idle | `POST /api/ble/disconnect` or remote disconnect |
+
+**Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | /api/ble/scan | Scan for BLE peripherals, return list |
+| POST | /api/ble/connect | Connect to a BLE peripheral by address |
+| POST | /api/ble/disconnect | Disconnect from current peripheral |
+| GET | /api/ble/status | Connection state and device info |
+| POST | /api/ble/write | Write raw bytes to a GATT characteristic |
+
+**POST /api/ble/scan** body (optional):
+```json
+{"timeout": 5.0, "name_filter": "iOS-Keyboard"}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| timeout | float | 5.0 | Scan duration in seconds |
+| name_filter | string | (none) | Only return devices whose name contains this string |
+
+**Response:**
+```json
+{
+  "ok": true,
+  "devices": [
+    {"address": "1C:DB:D4:84:58:CC", "name": "iOS-Keyboard", "rssi": -45}
+  ]
+}
+```
+
+**POST /api/ble/connect** body:
+```json
+{"address": "1C:DB:D4:84:58:CC"}
+```
+
+**Response:**
+```json
+{
+  "ok": true,
+  "address": "1C:DB:D4:84:58:CC",
+  "name": "iOS-Keyboard",
+  "services": [
+    {
+      "uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+      "characteristics": [
+        {"uuid": "6e400002-b5a3-f393-e0a9-e50e24dcca9e", "properties": ["write", "write-without-response"]},
+        {"uuid": "6e400003-b5a3-f393-e0a9-e50e24dcca9e", "properties": ["notify"]}
+      ]
+    }
+  ]
+}
+```
+
+**POST /api/ble/disconnect** — no body required.
+
+**Response:**
+```json
+{"ok": true}
+```
+
+**GET /api/ble/status** response:
+```json
+{
+  "ok": true,
+  "state": "connected",
+  "address": "1C:DB:D4:84:58:CC",
+  "name": "iOS-Keyboard"
+}
+```
+
+States: `"idle"`, `"scanning"`, `"connected"`.
+
+**POST /api/ble/write** body:
+```json
+{"characteristic": "6e400002-b5a3-f393-e0a9-e50e24dcca9e", "data": "024865 6c6c6f", "response": true}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| characteristic | string | Yes | Target GATT characteristic UUID |
+| data | string | Yes | Hex-encoded bytes to write |
+| response | bool | No (default true) | Use write-with-response (true) or write-without-response (false) |
+
+**Response:**
+```json
+{"ok": true, "bytes_written": 6}
+```
+
+**Error responses:**
+
+| Condition | HTTP | Response |
+|-----------|------|----------|
+| Not connected | 409 | `{"ok": false, "error": "not connected"}` |
+| Already connected | 409 | `{"ok": false, "error": "already connected to 1C:DB:D4:84:58:CC"}` |
+| Device not found | 404 | `{"ok": false, "error": "device not found"}` |
+| Write failed | 500 | `{"ok": false, "error": "write failed: ..."}` |
+| Invalid hex data | 400 | `{"ok": false, "error": "invalid hex data"}` |
+
+**Driver methods:**
+```python
+devices = wt.ble_scan(timeout=5.0, name_filter="iOS-Keyboard")
+info = wt.ble_connect("1C:DB:D4:84:58:CC")
+status = wt.ble_status()
+wt.ble_write("6e400002-b5a3-f393-e0a9-e50e24dcca9e", bytes([0x02]) + b"Hello")
+wt.ble_disconnect()
+```
+
+**Implementation notes:**
+- `ble_controller.py` runs its own `asyncio` event loop in a background
+  thread (bleak is async, portal is sync)
+- Module-level lock (`_lock`) serializes all BLE operations
+- Connection state tracked in module globals: `_client`, `_address`, `_name`
+- Disconnect callback updates state automatically on remote disconnect
+- Scan results are ephemeral (not cached)
+- Only one BLE connection at a time (Raspberry Pi hardware limitation
+  with single radio)
 
 ---
 
@@ -1030,6 +1348,26 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | WT-901 | Test progress step update | Test Progress | No |
 | WT-902 | Test progress result recording | Test Progress | No |
 | WT-903 | Test progress end session | Test Progress | No |
+| WT-1000 | UDP log receive single line | UDP Log | Yes |
+| WT-1001 | UDP log receive from multiple sources | UDP Log | Yes |
+| WT-1002 | UDP log filter by source | UDP Log | Yes |
+| WT-1003 | UDP log filter by since | UDP Log | Yes |
+| WT-1004 | UDP log clear | UDP Log | No |
+| WT-1005 | UDP log buffer overflow (>2000 lines) | UDP Log | Yes |
+| WT-1100 | Firmware upload | OTA Firmware | No |
+| WT-1101 | Firmware list | OTA Firmware | No |
+| WT-1102 | Firmware download | OTA Firmware | No |
+| WT-1103 | Firmware delete | OTA Firmware | No |
+| WT-1104 | Firmware path traversal rejected | OTA Firmware | No |
+| WT-1105 | ESP32 OTA from Pi firmware repo | OTA Firmware | Yes |
+| WT-1200 | BLE scan finds devices | BLE Proxy | Yes |
+| WT-1201 | BLE scan with name filter | BLE Proxy | Yes |
+| WT-1202 | BLE connect to device | BLE Proxy | Yes |
+| WT-1203 | BLE status shows connected | BLE Proxy | Yes |
+| WT-1204 | BLE write to characteristic | BLE Proxy | Yes |
+| WT-1205 | BLE disconnect | BLE Proxy | Yes |
+| WT-1206 | BLE write when not connected | BLE Proxy | No |
+| WT-1207 | BLE double connect rejected | BLE Proxy | Yes |
 
 \* WT-503/504 require a running AP (wifi_network fixture) but not a physical DUT.
 
@@ -1052,6 +1390,7 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 6.0 | 2026-02-08 | Claude | Service separation — Serial and WiFi as independent services with state models (§1.6); serial reset (FR-008) and serial monitor (FR-009) as first-class API operations; flapping recovery via active reset; WiFi section renamed to WiFi Service with states Idle/Captive/AP; enter-portal rewritten as composite serial operation; consolidated API table (FR-010) |
 | 6.1 | 2026-02-09 | Claude | Human interaction request (FR-017): blocking endpoint for test steps requiring physical operator actions; pulsing orange UI modal; ThreadingHTTPServer for concurrent requests; driver `human_interaction()` method; WT-700–703 test cases |
 | 6.2 | 2026-02-09 | Claude | GPIO control (FR-018): drive Pi GPIO pins from test scripts to control DUT hardware signals (e.g. hold GPIO 2 low during boot for captive portal trigger); pin allowlist, lazy gpiod init, release-to-input lifecycle; WT-800–806 test cases. Test progress tracking (FR-019): live test session updates pushed to web UI; WT-900–903 test cases |
+| 7.0 | 2026-02-25 | Claude | Three new services: UDP log receiver (FR-020) for ESP32 remote debug logs on port 5555; OTA firmware repository (FR-021) for serving .bin files to ESP32 OTA clients; BLE proxy (FR-022) for scan/connect/write to BLE peripherals via HTTP API using bleak. New deliverable: `ble_controller.py`. WT-1000–1207 test cases |
 
 ---
 
@@ -1221,12 +1560,13 @@ WantedBy=multi-user.target
 
 ### A.9 Network Ports
 
-| Port | Service |
-|------|---------|
-| 8080 | Web portal and API |
-| 4001 | SLOT1 RFC2217 |
-| 4002 | SLOT2 RFC2217 |
-| 4003 | SLOT3 RFC2217 |
+| Port | Protocol | Service |
+|------|----------|---------|
+| 8080 | TCP/HTTP | Web portal, REST API, firmware downloads |
+| 4001 | TCP/RFC2217 | SLOT1 serial proxy |
+| 4002 | TCP/RFC2217 | SLOT2 serial proxy |
+| 4003 | TCP/RFC2217 | SLOT3 serial proxy |
+| 5555 | UDP | ESP32 debug log receiver |
 
 ### A.10 WiFi Configuration Constants
 
@@ -1340,12 +1680,37 @@ Add this to /etc/rfc2217/slots.json:
 - [x] TASK-082: Add `test_start/step/result/end()` methods to `wifi_tester_driver.py`
 - [ ] TASK-083: Implement WT-900–903 test progress test cases
 
+**UDP Log Receiver (v7.0):**
+- [ ] TASK-090: Implement UDP socket listener thread in portal.py (FR-020)
+- [ ] TASK-091: Implement `GET /api/udplog` and `DELETE /api/udplog` endpoints
+- [ ] TASK-092: Add `udplog()` and `udplog_clear()` methods to `wifi_tester_driver.py`
+- [ ] TASK-093: Implement WT-1000–1005 UDP log test cases
+
+**OTA Firmware Repository (v7.0):**
+- [ ] TASK-100: Create firmware directory and path-safe file serving (FR-021)
+- [ ] TASK-101: Implement `GET /firmware/<project>/<filename>` binary serving
+- [ ] TASK-102: Implement `GET /api/firmware/list`, `POST /api/firmware/upload`, `DELETE /api/firmware/delete`
+- [ ] TASK-103: Add `firmware_list/upload/delete()` methods to `wifi_tester_driver.py`
+- [ ] TASK-104: Update install.sh to create firmware directory
+- [ ] TASK-105: Implement WT-1100–1105 firmware test cases
+
+**BLE Proxy (v7.0):**
+- [ ] TASK-110: Create `ble_controller.py` with asyncio event loop thread (FR-022)
+- [ ] TASK-111: Implement BLE scan with optional name filter
+- [ ] TASK-112: Implement BLE connect/disconnect with state tracking
+- [ ] TASK-113: Implement BLE write to GATT characteristic
+- [ ] TASK-114: Add BLE API routes to portal.py (`/api/ble/*`)
+- [ ] TASK-115: Add `ble_scan/connect/disconnect/status/write()` methods to `wifi_tester_driver.py`
+- [ ] TASK-116: Update install.sh to install bleak dependency
+- [ ] TASK-117: Implement WT-1200–1207 BLE proxy test cases
+
 ### C.2 Deliverables
 
 | Deliverable | Description |
 |-------------|-------------|
-| `portal.py` | HTTP server with serial slot management, WiFi API, process supervision, hotplug handling |
+| `portal.py` | HTTP server with serial slot management, WiFi API, BLE API, UDP log, firmware serving, process supervision, hotplug handling |
 | `wifi_controller.py` | WiFi instrument backend (hostapd, dnsmasq, wpa_supplicant, iw, HTTP relay) |
+| `ble_controller.py` | BLE proxy backend (bleak, scan, connect, write to GATT characteristics) |
 | `plain_rfc2217_server.py` | RFC2217 server with direct DTR/RTS passthrough (all devices) |
 | ~~`esp_rfc2217_server.py`~~ | Removed — breaks C3 native USB and classic ESP32 over RFC2217 |
 | ~~`serial_proxy.py`~~ | Removed — replaced by plain_rfc2217_server.py |
@@ -1357,4 +1722,4 @@ Add this to /etc/rfc2217/slots.json:
 | `slots.json` | Slot configuration file |
 | `wifi_tester_driver.py` | HTTP driver for running WT-xxx tests against the instrument |
 | `conftest.py` | Pytest fixtures (`wifi_tester`, `wifi_network`, `--wt-url`, `--run-dut`) |
-| `test_instrument.py` | WiFi tester self-tests (32 test cases, WT-100 through WT-603) |
+| `test_instrument.py` | Self-tests (WT-100 through WT-1207) |

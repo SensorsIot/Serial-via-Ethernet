@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import wifi_controller
+try:
+    import ble_controller
+except ImportError:
+    ble_controller = None
 
 PORT = 8080
 CONFIG_FILE = os.environ.get("RFC2217_CONFIG", "/etc/rfc2217/slots.json")
@@ -74,6 +78,16 @@ _gpio_requests = {}     # pin -> gpiod.LineRequest
 _gpio_directions = {}   # pin -> "output" | "input"
 GPIO_ALLOWED = {5, 6, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}  # BCM GPIOs safe for DUT control
 
+# UDP log receiver — ESP32 devices send debug logs over UDP to port 5555
+UDP_LOG_PORT = int(os.environ.get("UDP_LOG_PORT", "5555"))
+UDP_LOG_MAX_LINES = 2000
+_udp_log: collections.deque = collections.deque(maxlen=UDP_LOG_MAX_LINES)
+_udp_thread: threading.Thread | None = None
+_udp_shutdown = threading.Event()
+
+# OTA firmware repository — serve .bin files for ESP32 OTA updates
+FIRMWARE_DIR = os.environ.get("FIRMWARE_DIR", "/var/lib/rfc2217/firmware")
+
 
 def _gpio_set(pin, value):
     """Set a GPIO pin: value=0 (low), 1 (high), or "z" (input with pull-up)."""
@@ -125,6 +139,47 @@ def log_activity(msg: str, cat: str = "info"):
     }
     activity_log.append(entry)
     print(f"[activity] [{cat}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# UDP Log Receiver
+# ---------------------------------------------------------------------------
+
+def _udp_log_thread():
+    """Background thread: listen for UDP log packets on port 5555."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", UDP_LOG_PORT))
+    sock.settimeout(1.0)
+    print(f"[udplog] listening on UDP :{UDP_LOG_PORT}", flush=True)
+    while not _udp_shutdown.is_set():
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        source_ip = addr[0]
+        try:
+            text = data.decode("utf-8", errors="replace").rstrip("\r\n")
+        except Exception:
+            continue
+        ts = time.time()
+        for line in text.split("\n"):
+            line = line.rstrip("\r")
+            if line:
+                _udp_log.append({"ts": ts, "source": source_ip, "line": line})
+                log_activity(f"[{source_ip}] {line}", "info")
+    sock.close()
+    print("[udplog] stopped", flush=True)
+
+
+def start_udp_log():
+    """Start the UDP log receiver thread."""
+    global _udp_thread
+    _udp_shutdown.clear()
+    _udp_thread = threading.Thread(target=_udp_log_thread, daemon=True, name="udp-log")
+    _udp_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +802,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -779,6 +834,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_test_progress()
         elif path == "/api/gpio/status":
             self._handle_gpio_status()
+        elif path == "/api/udplog":
+            qs = parse_qs(parsed.query)
+            self._handle_get_udplog(qs)
+        elif path == "/api/firmware/list":
+            self._handle_firmware_list()
+        elif path == "/api/ble/status":
+            self._handle_ble_status()
+        elif path.startswith("/firmware/"):
+            self._handle_firmware_download(path)
         elif path in ("/", "/index.html"):
             self._serve_ui()
         else:
@@ -823,6 +887,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_test_update()
         elif path == "/api/gpio/set":
             self._handle_gpio_set()
+        elif path == "/api/firmware/upload":
+            self._handle_firmware_upload()
+        elif path == "/api/ble/scan":
+            self._handle_ble_scan()
+        elif path == "/api/ble/connect":
+            self._handle_ble_connect()
+        elif path == "/api/ble/disconnect":
+            self._handle_ble_disconnect()
+        elif path == "/api/ble/write":
+            self._handle_ble_write()
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if path == "/api/udplog":
+            _udp_log.clear()
+            self._send_json({"ok": True})
+        elif path == "/api/firmware/delete":
+            self._handle_firmware_delete()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1424,6 +1508,229 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pins[str(pin)] = {"direction": "unknown", "value": None}
         self._send_json({"ok": True, "pins": pins})
 
+    # -- UDP log handlers --
+
+    def _handle_get_udplog(self, qs):
+        since = float(qs.get("since", ["0"])[0])
+        source = qs.get("source", [""])[0]
+        limit = int(qs.get("limit", ["200"])[0])
+        lines = []
+        for entry in _udp_log:
+            if entry["ts"] <= since:
+                continue
+            if source and entry["source"] != source:
+                continue
+            lines.append(entry)
+            if len(lines) >= limit:
+                break
+        self._send_json({"ok": True, "lines": lines})
+
+    # -- firmware handlers --
+
+    def _handle_firmware_list(self):
+        files = []
+        if os.path.isdir(FIRMWARE_DIR):
+            for project in sorted(os.listdir(FIRMWARE_DIR)):
+                proj_dir = os.path.join(FIRMWARE_DIR, project)
+                if not os.path.isdir(proj_dir):
+                    continue
+                for fname in sorted(os.listdir(proj_dir)):
+                    fpath = os.path.join(proj_dir, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    stat = os.stat(fpath)
+                    files.append({
+                        "project": project,
+                        "filename": fname,
+                        "size": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                    })
+        self._send_json({"ok": True, "files": files})
+
+    def _handle_firmware_download(self, path):
+        # path = /firmware/<project>/<filename>
+        parts = path.split("/")
+        # ["", "firmware", project, filename]
+        if len(parts) != 4:
+            self._send_json({"error": "invalid path"}, 400)
+            return
+        project = parts[2]
+        filename = parts[3]
+        if ".." in project or ".." in filename or "/" in project or "/" in filename:
+            self._send_json({"error": "path traversal not allowed"}, 400)
+            return
+        fpath = os.path.join(FIRMWARE_DIR, project, filename)
+        if not os.path.isfile(fpath):
+            self._send_json({"error": "not found"}, 404)
+            return
+        try:
+            fsize = os.path.getsize(fpath)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", fsize)
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            with open(fpath, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except BrokenPipeError:
+            pass
+
+    def _handle_firmware_upload(self):
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self._send_json({"ok": False, "error": "expected multipart/form-data"}, 400)
+            return
+        # Parse boundary
+        boundary = None
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part[9:].strip('"')
+        if not boundary:
+            self._send_json({"ok": False, "error": "missing boundary"}, 400)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+        body = self.rfile.read(length)
+        boundary_bytes = boundary.encode()
+        parts_raw = body.split(b"--" + boundary_bytes)
+        project = None
+        file_data = None
+        file_name = None
+        for part in parts_raw:
+            part = part.strip()
+            if not part or part == b"--":
+                continue
+            if b"\r\n\r\n" in part:
+                header_section, content = part.split(b"\r\n\r\n", 1)
+            elif b"\n\n" in part:
+                header_section, content = part.split(b"\n\n", 1)
+            else:
+                continue
+            headers_text = header_section.decode("utf-8", errors="replace")
+            if content.endswith(b"\r\n"):
+                content = content[:-2]
+            if 'name="project"' in headers_text:
+                project = content.decode("utf-8").strip()
+            elif 'name="file"' in headers_text:
+                file_data = content
+                # Extract filename from Content-Disposition
+                for line in headers_text.split("\n"):
+                    if "filename=" in line:
+                        idx = line.index("filename=")
+                        file_name = line[idx + 9:].strip().strip('"').strip("'")
+        if not project or file_data is None or not file_name:
+            self._send_json({"ok": False, "error": "missing project or file"}, 400)
+            return
+        if ".." in project or "/" in project or ".." in file_name or "/" in file_name:
+            self._send_json({"ok": False, "error": "path traversal not allowed"}, 400)
+            return
+        proj_dir = os.path.join(FIRMWARE_DIR, project)
+        os.makedirs(proj_dir, exist_ok=True)
+        fpath = os.path.join(proj_dir, file_name)
+        with open(fpath, "wb") as f:
+            f.write(file_data)
+        log_activity(f"firmware.upload({project}/{file_name}, {len(file_data)} bytes)", "ok")
+        self._send_json({"ok": True, "project": project, "filename": file_name, "size": len(file_data)})
+
+    def _handle_firmware_delete(self):
+        body = self._read_json()
+        if not body:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+        project = body.get("project", "")
+        filename = body.get("filename", "")
+        if not project or not filename:
+            self._send_json({"ok": False, "error": "missing project or filename"}, 400)
+            return
+        if ".." in project or ".." in filename:
+            self._send_json({"ok": False, "error": "path traversal not allowed"}, 400)
+            return
+        fpath = os.path.join(FIRMWARE_DIR, project, filename)
+        if not os.path.isfile(fpath):
+            self._send_json({"ok": False, "error": "not found"}, 404)
+            return
+        os.remove(fpath)
+        log_activity(f"firmware.delete({project}/{filename})", "ok")
+        self._send_json({"ok": True})
+
+    # -- BLE handlers --
+
+    def _handle_ble_scan(self):
+        if not ble_controller or not ble_controller.available():
+            self._send_json({"ok": False, "error": "BLE not available (bleak not installed)"}, 501)
+            return
+        body = self._read_json() or {}
+        timeout = body.get("timeout", 0)
+        name_filter = body.get("name_filter", "")
+        log_activity(f"ble.scan(timeout={timeout}, filter={name_filter!r})", "step")
+        result = ble_controller.scan(timeout=timeout, name_filter=name_filter)
+        if result.get("ok"):
+            log_activity(f"ble.scan — found {len(result.get('devices', []))} devices", "ok")
+        else:
+            log_activity(f"ble.scan — {result.get('error')}", "error")
+        self._send_json(result)
+
+    def _handle_ble_connect(self):
+        if not ble_controller or not ble_controller.available():
+            self._send_json({"ok": False, "error": "BLE not available (bleak not installed)"}, 501)
+            return
+        body = self._read_json() or {}
+        address = body.get("address", "")
+        if not address:
+            self._send_json({"ok": False, "error": "missing address"}, 400)
+            return
+        log_activity(f"ble.connect({address})", "step")
+        result = ble_controller.connect(address)
+        if result.get("ok"):
+            log_activity(f"ble.connect({address}) — connected", "ok")
+        else:
+            log_activity(f"ble.connect({address}) — {result.get('error')}", "error")
+        self._send_json(result, 200 if result.get("ok") else 409)
+
+    def _handle_ble_disconnect(self):
+        if not ble_controller or not ble_controller.available():
+            self._send_json({"ok": False, "error": "BLE not available (bleak not installed)"}, 501)
+            return
+        log_activity("ble.disconnect", "step")
+        result = ble_controller.disconnect()
+        log_activity("ble.disconnect — done", "ok")
+        self._send_json(result)
+
+    def _handle_ble_status(self):
+        if not ble_controller or not ble_controller.available():
+            self._send_json({"ok": True, "state": "unavailable", "error": "bleak not installed"})
+            return
+        self._send_json(ble_controller.status())
+
+    def _handle_ble_write(self):
+        if not ble_controller or not ble_controller.available():
+            self._send_json({"ok": False, "error": "BLE not available (bleak not installed)"}, 501)
+            return
+        body = self._read_json() or {}
+        characteristic = body.get("characteristic", "")
+        data_hex = body.get("data", "")
+        response = body.get("response", True)
+        if not characteristic:
+            self._send_json({"ok": False, "error": "missing characteristic"}, 400)
+            return
+        if not data_hex:
+            self._send_json({"ok": False, "error": "missing data"}, 400)
+            return
+        try:
+            data = bytes.fromhex(data_hex.replace(" ", ""))
+        except ValueError:
+            self._send_json({"ok": False, "error": "invalid hex data"}, 400)
+            return
+        result = ble_controller.write(characteristic, data, response=response)
+        self._send_json(result, 200 if result.get("ok") else 500)
+
     def _serve_ui(self):
         html = _UI_HTML
         body = html.encode()
@@ -1893,11 +2200,17 @@ def main():
     # Scan for devices already plugged in at boot
     scan_existing_devices()
 
+    # Start UDP log receiver
+    start_udp_log()
+
+    # Ensure firmware directory exists
+    os.makedirs(FIRMWARE_DIR, exist_ok=True)
+
     addr = ("", PORT)
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     httpd = http.server.ThreadingHTTPServer(addr, Handler)
     print(
-        f"[portal] v4 listening on http://0.0.0.0:{PORT}  "
+        f"[portal] v5 listening on http://0.0.0.0:{PORT}  "
         f"host_ip={host_ip}  hostname={hostname}",
         flush=True,
     )
@@ -1905,7 +2218,10 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("[portal] shutting down", flush=True)
+        _udp_shutdown.set()
         wifi_controller.shutdown()
+        if ble_controller:
+            ble_controller.shutdown()
         # Stop all running proxies
         for slot in slots.values():
             if slot["running"] and slot["pid"]:
