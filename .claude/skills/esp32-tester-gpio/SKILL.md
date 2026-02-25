@@ -11,7 +11,7 @@ Base URL: `http://192.168.0.87:8080`
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/gpio/set` | Drive a pin: 0 (low) or 1 (high) |
+| POST | `/api/gpio/set` | Drive a pin: `0` (low) or `1` (high) |
 | GET | `/api/gpio/status` | Read state of all driven pins |
 
 ## Allowed BCM Pins
@@ -42,14 +42,10 @@ curl http://192.168.0.87:8080/api/gpio/status
 | GPIO17 | EN | **RST** — pull LOW to reset the ESP32 |
 | GPIO18 | GPIO0 | **BOOT** — hold LOW during reset to enter download mode |
 
-## CRITICAL: Never Use Hi-Z on EN or BOOT Pins
+## CRITICAL: Only Use LOW (0) and HIGH (1)
 
-**Never use `"z"` (hi-Z) on pins connected to ESP32 EN or BOOT.** Hi-Z leaves the
-pin floating, which crashes the Pi (the Pi Zero W's dwc_otg USB controller is
-sensitive to floating GPIO lines connected to ESP32 EN/BOOT).
-
-- **Release = drive HIGH (`1`)**
-- **Only use `0` (low) and `1` (high)** for EN and BOOT pins
+**Only use `0` (low) and `1` (high) for EN and BOOT pins.** Release = drive HIGH.
+Never use hi-Z — floating pins crash the Pi's dwc_otg USB controller.
 
 ## Common Workflows
 
@@ -141,8 +137,7 @@ curl -X POST http://192.168.0.87:8080/api/serial/reset \
 | Problem | Fix |
 |---------|-----|
 | "pin not in allowed set" | Use only the BCM pins listed above |
-| "value must be 0, 1, or 'z'" | Pin must be integer; value must be `0`, `1`, or `"z"` |
 | Pin stays driven after test | Drive pins HIGH (`1`) to release |
-| **Pi crashes during GPIO reset** | **Never use hi-Z (`"z"`) on EN or BOOT pins.** Only use LOW (`0`) and HIGH (`1`). Floating pins crash the Pi's dwc_otg USB controller. |
+| **Pi crashes during GPIO reset** | **Only use LOW (`0`) and HIGH (`1`).** Floating pins crash the Pi's dwc_otg USB controller. |
 | GPIO reset not needed | Board may have onboard auto-download circuit (dual-USB hub board) — use DTR/RTS via JTAG slot instead |
 | Probe shows crash loop output | Board is rebooting from firmware panic, not from GPIO. Erase flash first for clean probe. |

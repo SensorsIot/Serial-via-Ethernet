@@ -832,14 +832,13 @@ without requiring the rapid-reset approach or physical button presses.
 
 Requests for pins outside this set return HTTP 400.
 
-**IMPORTANT — Always release pins by driving HIGH:** GPIO pins connected to
-ESP32 EN or BOOT must be released by driving HIGH (`1`), never by setting
-hi-Z (`"z"`).  Hi-Z leaves pins floating, which crashes the Pi's dwc_otg
-USB controller.  Leave pins driven HIGH when not actively asserting them.
+**IMPORTANT — Only use LOW and HIGH:** GPIO pins connected to ESP32 EN or
+BOOT must only be driven LOW (`0`) or HIGH (`1`).  Release = drive HIGH.
+Never use hi-Z — floating pins crash the Pi's dwc_otg USB controller.
 
 #### 18.1 Endpoints
 
-**`POST /api/gpio/set`** — Drive a GPIO pin or release it
+**`POST /api/gpio/set`** — Drive a GPIO pin
 
 Request body:
 ```json
@@ -849,7 +848,7 @@ Request body:
 | Field | Type | Required | Values | Description |
 |-------|------|----------|--------|-------------|
 | pin | int | Yes | See allowlist | Pi BCM GPIO pin number |
-| value | int/string | Yes | `0`, `1`, `"z"` | 0 = drive low, 1 = drive high, "z" = release to input (high-Z). **Never use "z" on EN/BOOT pins — crashes Pi.** |
+| value | int | Yes | `0`, `1` | 0 = drive low, 1 = drive high |
 
 Response:
 ```json
@@ -863,7 +862,7 @@ Response:
 {"ok": true, "pins": {"17": {"direction": "output", "value": 0}}}
 ```
 
-Pins that have been released (value `"z"`) do not appear in the response.
+All driven pins appear in the response.
 
 #### 18.2 Implementation
 
@@ -872,8 +871,7 @@ Pins that have been released (value `"z"`) do not appear in the response.
 - **gpiod v2 API:** Uses `gpiod.line.Direction.OUTPUT`,
   `gpiod.line.Value.ACTIVE`/`INACTIVE`, `request_lines()`, `set_value()`,
   `get_value()`, `release()`
-- **Resource management:** Releasing a pin (`"z"`) calls
-  `LineRequest.release()` and removes the pin from the active set
+- **Resource management:** Pins remain driven until explicitly changed
 
 #### 18.3 Captive Portal via GPIO
 
@@ -1404,8 +1402,7 @@ using a two-step probe:
 
 #### Probe Algorithm
 
-**CRITICAL:** Never use hi-Z (`"z"`) on EN or BOOT pins.  Only use LOW (`0`) and
-HIGH (`1`).  Hi-Z leaves pins floating, which crashes the Pi's dwc_otg USB controller.
+**CRITICAL:** Only use LOW (`0`) and HIGH (`1`) on EN and BOOT pins.  Release = drive HIGH.
 
 ```
 Step 1: Try GPIO-based download mode entry
@@ -1446,9 +1443,9 @@ Step 2: Try USB DTR/RTS reset (fallback)
 
 #### Caveats
 
-1. **Never use hi-Z (`"z"`) on EN or BOOT pins.**  The Pi Zero W's dwc_otg USB
+1. **Only use LOW and HIGH on EN/BOOT pins.**  The Pi Zero W's dwc_otg USB
    controller crashes when GPIO lines connected to ESP32 EN/BOOT float.
-   Only use LOW (`0`) and HIGH (`1`) for these pins.
+   Never use hi-Z.  Release = drive HIGH (`1`).
 2. **Firmware crash loops** produce continuous `rst:0xc` resets that can mask a
    GPIO-triggered reset.  For reliable probing, first erase flash
    (`esptool.py erase_flash`) so the board sits idle in bootloader, or flash
