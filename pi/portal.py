@@ -645,127 +645,63 @@ def serial_monitor(slot: dict, pattern: str | None = None,
 # Enter-portal — composite serial operation (FR-008 + FR-009)
 # ---------------------------------------------------------------------------
 
-def _do_enter_portal(slot: dict, num_resets: int = 3):
-    """Reset an ESP32 device repeatedly to trigger captive portal mode.
+def _do_enter_portal(portal_ssid: str, wifi_ssid: str, wifi_password: str):
+    """Connect to a device's captive portal SoftAP and submit WiFi credentials.
 
-    Uses direct serial (FR-008 serial_reset) for the reset pulses, keeping
-    the serial connection open across resets for rapid cycling.  This is
-    a composite operation built on the serial service primitives.
+    1. Join the device's SoftAP (portal_ssid, open network)
+    2. POST credentials to http://192.168.4.1/connect
+    3. Disconnect from SoftAP
+    4. Start our own AP with the submitted credentials so the device can connect
     """
-    import serial as pyserial
-    import re
+    import urllib.parse
 
-    label = slot["label"]
-    devnode = slot.get("devnode")
-
-    if not devnode:
-        log_activity(f"{label}: no device node — is the device plugged in?", "error")
-        return
-
-    def _send_reset(ser):
-        """Send DTR/RTS reset pulse."""
-        ser.dtr = True;  time.sleep(0.05);  ser.dtr = False
-        time.sleep(0.05)
-        ser.rts = True;  time.sleep(0.05);  ser.rts = False
-
-    def _parse_ap_info(lines):
-        """Extract SSID and password from 'AP Started: ...' serial line."""
-        for l in lines:
-            if "AP Started:" not in l:
-                continue
-            ssid = pw = ""
-            m = re.search(r"SSID=(\S+)", l)
-            if m:
-                ssid = m.group(1).rstrip(",")
-            m = re.search(r"Pass=(\S+)", l)
-            if m:
-                pw = m.group(1).rstrip(",")
-            return ssid, pw
-        return "", ""
-
-    def _parse_wifi_info(lines):
-        """Extract SSID and IP from WiFi connect serial lines."""
-        for l in lines:
-            if "WiFi connected" not in l:
-                continue
-            m = re.search(r"IP:\s*(\S+)", l)
-            ip = m.group(1) if m else "?"
-            via = "NVS" if "via NVS" in l else "fallback"
-            return ip, via
-        return "", ""
-
-    # Stop proxy so we can use direct serial for rapid resets
-    with slot["_lock"]:
-        stop_proxy(slot)
-        slot["state"] = STATE_RESETTING
-
-    # -- Open direct serial (not RFC2217) --
-    log_activity(f"Opening {label} direct serial ({devnode})...", "step")
+    # -- Step 1: join the device's captive portal SoftAP --
+    log_activity(f"Joining captive portal SoftAP '{portal_ssid}'...", "step")
     try:
-        ser = pyserial.Serial(devnode, 115200, timeout=0.1)
-        ser.dtr = False
-        ser.rts = False
-        time.sleep(0.1)
-        ser.read(8192)  # drain
+        result = wifi_controller.sta_join(portal_ssid, password="", timeout=15)
+        log_activity(f"Connected to '{portal_ssid}' — IP: {result.get('ip', '?')}", "ok")
     except Exception as e:
-        log_activity(f"Cannot open {devnode}: {e}", "error")
-        slot["state"] = STATE_IDLE if slot["present"] else STATE_ABSENT
+        log_activity(f"Failed to join '{portal_ssid}': {e}", "error")
         return
 
-    # -- Step 1: clean boot (reset boot counter) --
-    log_activity(f"serial.reset({label}) — clean boot...", "step")
-    _send_reset(ser)
-    lines, matched = _read_serial_lines(ser, "Boot count reset to 0", timeout=15)
-    ip, via = _parse_wifi_info(lines)
-    if ip:
-        log_activity(f"{label} in NORMAL mode — WiFi ({via}) IP: {ip}", "ok")
-    else:
-        log_activity(f"{label} clean boot done", "info")
-    time.sleep(1)
+    # -- Step 2: POST WiFi credentials to the captive portal --
+    log_activity(f"Submitting credentials (SSID: {wifi_ssid}) to captive portal...", "step")
+    try:
+        form_data = urllib.parse.urlencode({
+            "ssid": wifi_ssid,
+            "pass": wifi_password,
+        }).encode("utf-8")
+        import base64
+        body_b64 = base64.b64encode(form_data).decode("ascii")
+        resp = wifi_controller.http_relay(
+            method="POST",
+            url="http://192.168.4.1/connect",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=body_b64,
+            timeout=10,
+        )
+        log_activity(f"Portal responded with status {resp.get('status', '?')}", "ok")
+    except Exception as e:
+        log_activity(f"Failed to submit credentials: {e}", "error")
 
-    # -- Step 2: N rapid resets --
-    log_activity(f"Sending {num_resets} rapid resets to trigger captive portal...", "step")
-    ser.read(8192)  # drain
-    for i in range(1, num_resets + 1):
-        log_activity(f"serial.reset({label}) — reset {i}/{num_resets}", "step")
-        _send_reset(ser)
-        lines, matched = _read_serial_lines(ser, "Boot count:", timeout=5)
-        boot_line = [l for l in lines if "Boot count:" in l and "threshold" in l]
-        if boot_line:
-            log_activity(f"serial.monitor({label}) — {boot_line[-1]}", "info")
-        else:
-            log_activity(f"Reset {i}/{num_resets} — no boot count detected", "error")
-            ser.close()
-            slot["state"] = STATE_IDLE if slot["present"] else STATE_ABSENT
-            return
+    # -- Step 3: disconnect from the device's SoftAP --
+    log_activity("Disconnecting from captive portal SoftAP...", "step")
+    try:
+        wifi_controller.sta_leave()
+    except Exception as e:
+        log_activity(f"sta_leave error (non-fatal): {e}", "info")
 
-        if i < num_resets:
-            time.sleep(0.3)  # minimal gap before next reset
-
-    # -- Step 3: check for portal mode --
-    log_activity(f"serial.monitor({label}, 'PORTAL mode') — waiting...", "step")
-    lines2, matched = _read_serial_lines(ser, "PORTAL mode", timeout=10)
-    all_lines = lines + lines2
-    if matched:
-        ssid, pw = _parse_ap_info(all_lines)
+    # -- Step 4: start our AP so the device can connect to us --
+    log_activity(f"Starting AP '{wifi_ssid}' for device to connect...", "step")
+    try:
+        result = wifi_controller.ap_start(wifi_ssid, password=wifi_password)
         log_activity(
-            f"{label} in CAPTIVE PORTAL mode — "
-            f"SSID: {ssid}  Password: {pw}",
+            f"AP '{wifi_ssid}' running — IP: {result.get('ip', '?')}. "
+            f"Waiting for device to connect...",
             "ok",
         )
-    else:
-        ip, via = _parse_wifi_info(all_lines)
-        if ip:
-            log_activity(
-                f"{label} stayed in NORMAL mode (IP: {ip}) — "
-                f"resets too slow, WiFi connected before portal threshold",
-                "error",
-            )
-        else:
-            log_activity(f"{label} — portal mode not detected", "error")
-
-    ser.close()
-    slot["state"] = STATE_IDLE if slot["present"] else STATE_ABSENT
+    except Exception as e:
+        log_activity(f"Failed to start AP '{wifi_ssid}': {e}", "error")
 
 
 # ---------------------------------------------------------------------------
@@ -1306,29 +1242,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _handle_enter_portal(self):
         global _enter_portal_running
         body = self._read_json() or {}
-        slot_label = body.get("slot", "SLOT2")
-        num_resets = int(body.get("resets", 3))
+        portal_ssid = body.get("portal_ssid", "iOS-Keyboard-Setup")
+        wifi_ssid = body.get("ssid", "")
+        wifi_password = body.get("password", "")
+
+        if not wifi_ssid:
+            self._send_json({"ok": False, "error": "ssid is required"})
+            return
 
         if _enter_portal_running:
             self._send_json({"ok": False, "error": "enter-portal already running"})
             return
 
-        # Find slot by label
-        target_slot = _find_slot_by_label(slot_label)
-        if not target_slot:
-            self._send_json({"ok": False, "error": f"slot '{slot_label}' not found"})
-            return
-        if not target_slot["tcp_port"]:
-            self._send_json({"ok": False, "error": f"slot '{slot_label}' has no tcp_port"})
-            return
-
         _enter_portal_running = True
-        log_activity(f"Enter-portal started for {slot_label}", "step")
+        log_activity(f"Enter-portal: joining '{portal_ssid}', provisioning with '{wifi_ssid}'", "step")
 
-        def _bg_enter_portal(slot, n_resets):
+        def _bg_enter_portal():
             global _enter_portal_running
             try:
-                _do_enter_portal(slot, n_resets)
+                _do_enter_portal(portal_ssid, wifi_ssid, wifi_password)
             except Exception as e:
                 log_activity(f"Enter-portal error: {e}", "error")
             finally:
@@ -1336,7 +1268,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         threading.Thread(
             target=_bg_enter_portal,
-            args=(target_slot, num_resets),
             daemon=True,
         ).start()
 
