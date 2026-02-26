@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Workbench Test Device</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,system-ui,sans-serif;background:#f2f2f7;color:#1c1c1e;display:flex;justify-content:center;padding:40px 16px}
+.card{background:#fff;border-radius:12px;padding:24px;max-width:360px;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h1{font-size:20px;text-align:center;margin-bottom:20px}
+label{display:block;font-size:14px;font-weight:600;margin-bottom:4px;margin-top:16px}
+input{width:100%;padding:10px 12px;border:1px solid #c7c7cc;border-radius:8px;font-size:16px}
+input:focus{outline:none;border-color:#007aff}
+button{width:100%;padding:12px;margin-top:24px;background:#007aff;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer}
+button:active{background:#0056b3}
+button:disabled{background:#999}
+.msg{text-align:center;margin-top:12px;font-size:14px}
+.ok{color:#34c759}.err{color:#ff3b30}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Workbench Test Device</h1>
+<form id="f">
+<label for="ssid">WiFi Network</label>
+<input id="ssid" name="ssid" required autocomplete="off" placeholder="SSID">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" placeholder="Password (optional)">
+<button type="submit" id="btn">Connect</button>
+</form>
+<div class="msg" id="msg"></div>
+</div>
+<script>
+document.getElementById('f').onsubmit=async function(e){
+  e.preventDefault();
+  const btn=document.getElementById('btn'),msg=document.getElementById('msg');
+  btn.disabled=true;btn.textContent='Connecting...';msg.textContent='';
+  try{
+    const r=await fetch('/connect',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value})});
+    const d=await r.json();
+    if(r.ok){msg.className='msg ok';msg.textContent='Saved! Device is rebooting...';}
+    else{throw new Error(d.message||'Failed');}
+  }catch(err){msg.className='msg err';msg.textContent=err.message;btn.disabled=false;btn.textContent='Connect';}
+};
+</script>
+</body>
+</html>

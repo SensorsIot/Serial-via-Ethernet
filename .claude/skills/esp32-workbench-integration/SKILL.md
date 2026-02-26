@@ -55,20 +55,21 @@ Steps 1–7 handle firmware integration. Steps 8–12 write FSD sections 7–10.
 
 ## Template Reference
 
-All template code lives in `/workspaces/YouTube/workbench-test/`. When adding modules, copy from these templates and customize project-specific values:
+All template code lives in `Universal-ESP32-Workbench/test-firmware/`. When adding modules, copy from these templates and customize project-specific values:
 
 | Module | Template source | Customization |
 |--------|----------------|---------------|
-| `udp_log.c/.h` | `workbench-test/main/udp_log.c` | None (universal) |
-| `wifi_prov.c/.h` | `workbench-test/main/wifi_prov.c` | Change `AP_SSID`, `NVS_NAMESPACE`. Has retry backoff (1s→2s→4s→8s→16s cap) and 15-minute timeout. |
-| `portal.html` | `workbench-test/main/portal.html` | Change `<title>` and `<h1>` |
-| `ota.c/.h` | `workbench-test/main/ota.c` | Change `OTA_DEFAULT_URL` |
-| `ble_nus.c/.h` | `workbench-test/main/ble_nus.c` | Change BLE device name |
-| `cmd_handler.c/.h` | `workbench-test/main/cmd_handler.c` | Remove/add project-specific opcodes |
-| `dns_server/` | `workbench-test/components/dns_server/` | None (copy entire dir) |
-| `partitions.csv` | `workbench-test/partitions.csv` | None (dual OTA layout) |
-| `sdkconfig.defaults` | `workbench-test/sdkconfig.defaults` | Reference for required options |
-| `app_main.c` | `workbench-test/main/app_main.c` | Reference for init order only |
+| `udp_log.c/.h` | `test-firmware/main/udp_log.c` | None (universal) |
+| `wifi_prov.c/.h` | `test-firmware/main/wifi_prov.c` | Change `AP_SSID`. |
+| `portal.html` | `test-firmware/main/portal.html` | Change `<title>` and `<h1>` |
+| `ota_update.c/.h` | `test-firmware/main/ota_update.c` | Change `OTA_DEFAULT_URL` |
+| `ble_nus.c/.h` | `test-firmware/main/ble_nus.c` | Change BLE device name |
+| `http_server.c/.h` | `test-firmware/main/http_server.c` | Add project-specific endpoints |
+| `nvs_store.c/.h` | `test-firmware/main/nvs_store.c` | Change `NVS_NAMESPACE` |
+| `dns_server/` | `test-firmware/components/dns_server/` | None (copy entire dir) |
+| `partitions.csv` | `test-firmware/partitions.csv` | None (dual OTA layout) |
+| `sdkconfig.defaults` | `test-firmware/sdkconfig.defaults` | Reference for required options |
+| `app_main.c` | `test-firmware/main/app_main.c` | Reference for init order only |
 
 ## Workbench Compatibility Contract
 
