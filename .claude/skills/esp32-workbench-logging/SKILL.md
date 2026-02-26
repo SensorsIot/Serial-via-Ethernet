@@ -1,5 +1,5 @@
 ---
-name: esp32-workbench-serial-logging
+name: esp32-workbench-logging
 description: Serial monitor and UDP debug log retrieval from ESP32 devices. Covers pattern matching, boot capture, crash output, and runtime logging. Triggers on "serial monitor", "log", "debug log", "UDP log", "boot output", "crash", "monitor", "pattern".
 ---
 

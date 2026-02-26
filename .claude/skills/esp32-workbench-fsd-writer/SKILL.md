@@ -47,7 +47,7 @@ The workbench offers these capabilities through 8 skills. Only include what the 
 - Crash-loop recovery — `esptool erase_flash` works even during panic loops on native USB
 - Flapping recovery — handling USB connection storms from empty/corrupt flash
 
-**Serial Logging** (`esp32-workbench-serial-logging`)
+**Serial Logging** (`esp32-workbench-logging`)
 - Serial monitor — pattern matching on boot output, crash capture, regex with timeout
 - Serial reset — DTR/RTS hardware reset with boot output capture
 - UDP log receiver — non-blocking debug log collection over WiFi (port 5555)
@@ -222,7 +222,7 @@ Check that the testing chapter covers:
 | Skill | Key endpoints | What it enables |
 |-------|-------------|-----------------|
 | `esp32-workbench-serial-flashing` | `GET /api/devices`, `POST /api/serial/reset` | Device discovery, remote flashing (esptool via RFC2217), GPIO download mode, crash-loop recovery |
-| `esp32-workbench-serial-logging` | `POST /api/serial/monitor`, `GET /api/udplog` | Serial monitor with pattern matching, UDP log collection, boot/crash capture |
+| `esp32-workbench-logging` | `POST /api/serial/monitor`, `GET /api/udplog` | Serial monitor with pattern matching, UDP log collection, boot/crash capture |
 | `esp32-workbench-wifi` | `POST /api/enter-portal`, `GET /api/wifi/ap_status`, `GET /api/wifi/scan`, `POST /api/wifi/http`, `GET /api/wifi/events` | Captive portal provisioning, AP control, WiFi on/off testing, HTTP relay, event monitoring |
 | `esp32-workbench-gpio` | `POST /api/gpio/set`, `GET /api/gpio/status` | Boot mode control, hardware reset, button simulation, GPIO probe |
 | `esp32-workbench-ota` | `POST /api/firmware/upload`, `GET /api/firmware/list`, `POST /api/wifi/http` | Firmware upload/serve, OTA trigger via HTTP relay |

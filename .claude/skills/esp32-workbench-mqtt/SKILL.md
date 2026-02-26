@@ -44,7 +44,7 @@ curl -X POST http://192.168.0.87:8080/api/mqtt/stop
    - Ensure device is on workbench WiFi (see esp32-workbench-wifi)
    - `POST /api/mqtt/start` — start broker
    - Device connects to `192.168.4.1:1883`
-   - Monitor device behavior via serial or UDP logs (see esp32-workbench-serial-logging)
+   - Monitor device behavior via serial or UDP logs (see esp32-workbench-logging)
    - `POST /api/mqtt/stop` — stop broker when done
 
 2. **Test MQTT disconnect/reconnect:**

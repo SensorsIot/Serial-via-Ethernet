@@ -74,7 +74,7 @@ curl -X POST http://192.168.0.87:8080/api/wifi/http \
 # Via UDP logs (preferred — non-blocking)
 curl "http://192.168.0.87:8080/api/udplog?limit=50"
 
-# Or via serial monitor (see esp32-workbench-serial-logging)
+# Or via serial monitor (see esp32-workbench-logging)
 curl -X POST http://192.168.0.87:8080/api/serial/monitor \
   -H 'Content-Type: application/json' \
   -d '{"slot": "slot-1", "pattern": "OTA.*complete", "timeout": 60}'
@@ -103,5 +103,5 @@ curl -X DELETE http://192.168.0.87:8080/api/firmware/delete \
 | File not in list after upload | Check project/filename; `..` and `/` are rejected |
 | ESP32 can't download firmware | Device must reach workbench at 192.168.0.87:8080; check WiFi |
 | OTA trigger times out | Check device's OTA endpoint URL; increase HTTP relay timeout |
-| No progress in UDP logs | Device may not send UDP logs — check serial monitor instead (see esp32-workbench-serial-logging) |
+| No progress in UDP logs | Device may not send UDP logs — check serial monitor instead (see esp32-workbench-logging) |
 | OTA trigger returns error | Verify device firmware has OTA endpoint; check relay response body |

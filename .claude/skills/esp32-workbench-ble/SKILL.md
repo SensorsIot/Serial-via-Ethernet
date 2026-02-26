@@ -73,7 +73,7 @@ curl -X POST http://192.168.0.87:8080/api/ble/disconnect
    - Connect to device
    - Encode command bytes as hex (e.g., `0x02` + "Hello" = `0248656c6c6f`)
    - Write to NUS RX characteristic
-   - Monitor device response via serial or UDP logs (see esp32-workbench-serial-logging)
+   - Monitor device response via serial or UDP logs (see esp32-workbench-logging)
 
 ## Troubleshooting
 

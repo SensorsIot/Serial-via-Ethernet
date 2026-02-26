@@ -175,7 +175,7 @@ Monitor progress via `GET /api/log`.
 
 3. **Test WiFi disconnect/reconnect behavior:**
    - `POST /api/wifi/ap_stop` — device loses WiFi
-   - Monitor device via serial (see esp32-workbench-serial-logging)
+   - Monitor device via serial (see esp32-workbench-logging)
    - `POST /api/wifi/ap_start` — device should reconnect
    - `GET /api/wifi/events` — confirm reconnection
 
