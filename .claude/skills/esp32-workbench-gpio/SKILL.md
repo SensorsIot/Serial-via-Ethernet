@@ -1,6 +1,6 @@
 ---
-name: esp32-tester-gpio
-description: GPIO pin control on the Raspberry Pi tester for driving ESP32 boot modes and buttons. Triggers on "GPIO", "pin", "boot mode", "button", "hardware reset".
+name: esp32-workbench-gpio
+description: GPIO pin control on the Raspberry Pi workbench for driving ESP32 boot modes and buttons. Triggers on "GPIO", "pin", "boot mode", "button", "hardware reset".
 ---
 
 # ESP32 GPIO Control
@@ -82,7 +82,7 @@ Only use `0` (low) and `1` (high). Release = drive HIGH (`1`).
 
 ## Note: Dual-USB Hub Boards
 
-Some ESP32-S3 dev boards have an onboard USB hub with a built-in auto-download circuit that connects GPIO0/EN to DTR/RTS on the USB-Serial/JTAG interface. For these boards, **external Pi GPIO wiring for reset and boot mode is not needed** — DTR/RTS on the JTAG slot handles it via `POST /api/serial/reset` on the JTAG slot. See esp32-tester-serial for identifying dual-USB boards.
+Some ESP32-S3 dev boards have an onboard USB hub with a built-in auto-download circuit that connects GPIO0/EN to DTR/RTS on the USB-Serial/JTAG interface. For these boards, **external Pi GPIO wiring for reset and boot mode is not needed** — DTR/RTS on the JTAG slot handles it via `POST /api/serial/reset` on the JTAG slot. See esp32-workbench-serial for identifying dual-USB boards.
 
 ## GPIO Control Probe — Auto-Detecting Board Capabilities
 
@@ -127,7 +127,7 @@ curl -X POST http://192.168.0.87:8080/api/serial/reset \
 | No output | No output | No control — check wiring or wrong slot |
 
 ### Caveats
-- **Firmware crash loops** (`rst:0xc`) mask GPIO resets — continuous panic reboots make it impossible to distinguish a GPIO-triggered reset from a crash-triggered one. For reliable probing, first break the crash loop with `esptool.py --before=usb_reset erase_flash` (works even during crash loops on native USB devices — see esp32-tester-serial), then re-run the probe on the clean device.
+- **Firmware crash loops** (`rst:0xc`) mask GPIO resets — continuous panic reboots make it impossible to distinguish a GPIO-triggered reset from a crash-triggered one. For reliable probing, first break the crash loop with `esptool.py --before=usb_reset erase_flash` (works even during crash loops on native USB devices — see esp32-workbench-serial), then re-run the probe on the clean device.
 - **Dual-USB hub boards** always respond to USB DTR/RTS on the JTAG slot; GPIO probe will show no effect.
 - Probe only needs to run once per physical board.
 

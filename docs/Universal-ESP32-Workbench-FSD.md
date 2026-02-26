@@ -7,7 +7,7 @@
 Combined serial interface and WiFi test instrument running on a single
 Raspberry Pi Zero W.  The serial interface exposes USB serial devices to
 network clients via RFC2217 protocol with event-driven hotplug and slot-based
-port assignment.  The WiFi tester uses the Pi's onboard wlan0 radio as a
+port assignment.  The WiFi workbench uses the Pi's onboard wlan0 radio as a
 test instrument — starting SoftAP, joining networks, scanning, relaying HTTP,
 and reporting station events — all controlled over the same HTTP API.
 
@@ -35,7 +35,7 @@ and reporting station events — all controlled over the same HTTP API.
 │  └───────────┘          │              └─────────────────────────────────┘
 │                         │
 │  ┌───────────────────┐  │
-│  │ WiFi Tester       │  │
+│  │ WiFi Workbench    │  │
 │  │ wlan0 (onboard)   │  │
 │  │  AP: 192.168.4.1  │  │
 │  │  STA / Scan       │  │
@@ -76,18 +76,18 @@ and reporting station events — all controlled over the same HTTP API.
 
 The system operates in one of two modes at any time:
 
-| Mode | Default | eth0 | wlan0 | Serial | WiFi Tester |
+| Mode | Default | eth0 | wlan0 | Serial | WiFi Workbench |
 |------|---------|------|-------|--------|-------------|
 | **WiFi-Testing** | Yes | LAN (management + serial) | Test instrument (AP/STA/scan) | Active | Active |
 | **Serial Interface** | No | LAN (management + serial) | Joins WiFi for additional LAN | Active | Disabled |
 
 - **WiFi-Testing** (default): eth0 provides wired LAN connectivity.  wlan0 is
   dedicated to the WiFi test instrument — it can start a SoftAP, join external
-  networks, scan, and relay HTTP.  Both serial slots and WiFi tester are active.
+  networks, scan, and relay HTTP.  Both serial slots and WiFi workbench are active.
 
 - **Serial Interface**: wlan0 joins a user-specified WiFi network to provide
   wireless LAN connectivity (useful when no wired Ethernet is available).
-  Serial slots remain active.  WiFi tester endpoints return an error.
+  Serial slots remain active.  WiFi workbench endpoints return an error.
 
 Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 
@@ -106,9 +106,9 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 | rfc2217-learn-slots | /usr/local/bin/rfc2217-learn-slots | Slot configuration helper |
 | 99-rfc2217-hotplug.rules | /etc/udev/rules.d/ | udev rules for hotplug |
 | slots.json | /etc/rfc2217/slots.json | Slot-to-port mapping |
-| wifi_tester_driver.py | pytest/ | HTTP test driver for the WiFi instrument |
+| esp32_workbench_driver.py | pytest/ | HTTP test driver for the WiFi instrument |
 | conftest.py | pytest/ | Pytest fixtures and CLI options |
-| test_instrument.py | pytest/ | WiFi tester self-tests (WT-xxx) |
+| test_instrument.py | pytest/ | WiFi workbench self-tests (WT-xxx) |
 
 ### 1.6 State Model
 
@@ -615,7 +615,7 @@ Other slots are unaffected and continue operating normally.
 
 ### FR-010 — API Summary
 
-Complete API for both Serial and WiFi services.  WiFi tester endpoints (all
+Complete API for both Serial and WiFi services.  WiFi workbench endpoints (all
 except `/api/wifi/mode` and `/api/wifi/ping`) return `{"ok": false, "error":
 "WiFi testing disabled (Serial Interface mode)"}` when the system is in
 serial-interface mode.
@@ -656,13 +656,13 @@ serial-interface mode.
 | GET | /api/test/progress | Poll current test session state (FR-019) |
 | **Composite** | | |
 | GET | /api/log | Activity log (timestamped entries, filterable with `?since=`) |
-| POST | /api/enter-portal | Ensure device is connected to tester AP — provision via captive portal if needed |
+| POST | /api/enter-portal | Ensure device is connected to workbench AP — provision via captive portal if needed |
 
 #### Enter-Portal Composite Operation
 
-`POST /api/enter-portal` ensures a DUT is connected to the tester's WiFi AP.
+`POST /api/enter-portal` ensures a DUT is connected to the workbench's WiFi AP.
 If the device already has credentials it connects directly.  If not, the
-tester joins the device's captive portal SoftAP, fills in its own AP
+workbench joins the device's captive portal SoftAP, fills in its own AP
 credentials, and waits for the device to reboot and connect.
 
 **Request body:**
@@ -673,12 +673,12 @@ credentials, and waits for the device to reboot and connect.
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `portal_ssid` | Yes | The device's captive portal SoftAP name |
-| `ssid` | Yes | Tester AP SSID (filled into portal form, used to start AP) |
-| `password` | Yes | Tester AP password (filled into portal form, used to start AP) |
+| `ssid` | Yes | Workbench AP SSID (filled into portal form, used to start AP) |
+| `password` | Yes | Workbench AP password (filled into portal form, used to start AP) |
 
 **Procedure:**
-1. Ensure the tester's AP is running with `ssid`/`password` (start it if not)
-2. Wait for the DUT to connect to the tester AP (short timeout)
+1. Ensure the workbench's AP is running with `ssid`/`password` (start it if not)
+2. Wait for the DUT to connect to the workbench AP (short timeout)
 3. If connected → done (device already has credentials)
 4. If not connected → device is in captive portal mode:
    a. Join the DUT's captive portal SoftAP (`portal_ssid`)
@@ -686,7 +686,7 @@ credentials, and waits for the device to reboot and connect.
    c. Parse the portal HTML form, fill in `ssid` and `password`
    d. Submit the form
    e. Disconnect from the DUT's SoftAP
-   f. Wait for the DUT to reboot and connect to the tester AP
+   f. Wait for the DUT to reboot and connect to the workbench AP
 
 Each step is logged to the activity log.  Progress is observable via
 `GET /api/log?since=<ts>`.
@@ -761,7 +761,7 @@ WiFi side of the network:
 - Mode switch failure (e.g., can't join WiFi) reverts to `wifi-testing`
 - `GET /api/wifi/mode` returns `{mode}` (and `ssid`, `ip` when in
   serial-interface mode)
-- While in serial-interface mode, tester endpoints (`ap_start`, `ap_stop`,
+- While in serial-interface mode, workbench endpoints (`ap_start`, `ap_stop`,
   `sta_join`, `sta_leave`, `scan`, `http`) return a guard error
 
 ### FR-017 — Human Interaction Request
@@ -1065,12 +1065,12 @@ wt.firmware_delete("ios-keyboard", "ios-keyboard.bin")
 
 **End-to-end OTA workflow:**
 
-The tester supports a complete remote OTA workflow for ESP32 devices
+The workbench supports a complete remote OTA workflow for ESP32 devices
 connected to its WiFi AP.  The HTTP relay (`POST /api/wifi/http`) bridges
 the LAN and WiFi AP networks, allowing OTA to be triggered from any
 client on the LAN.
 
-1. **Upload firmware** to the tester's OTA repository:
+1. **Upload firmware** to the workbench's OTA repository:
    ```
    POST /api/firmware/upload  (multipart: project=ios-keyboard, file=ios-keyboard.bin)
    ```
@@ -1089,12 +1089,12 @@ client on the LAN.
    GET /api/udplog?source=192.168.4.15
    ```
    The ESP32 logs OTA progress (download bytes, partition writes, reboot)
-   which the tester captures on UDP port 5555.
+   which the workbench captures on UDP port 5555.
 
 **Prerequisites for the ESP32 device:**
-- Connected to the tester's WiFi AP (via `POST /api/enter-portal` or manual provisioning)
+- Connected to the workbench's WiFi AP (via `POST /api/enter-portal` or manual provisioning)
 - HTTP server running with a `POST /ota` trigger endpoint
-- OTA URL configured to point at the tester's firmware repository
+- OTA URL configured to point at the workbench's firmware repository
 
 **Implementation notes:**
 - Path traversal protection: reject `..` in both project and filename
@@ -1268,12 +1268,12 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
 
 - **Serial slot cards** — one card per configured slot showing label, status
   badge (RUNNING/PRESENT/EMPTY), devnode, PID, and copyable RFC2217 URL
-- **WiFi Tester section** — mode toggle (WiFi-Testing / Serial Interface),
+- **WiFi Workbench section** — mode toggle (WiFi-Testing / Serial Interface),
   AP status (SSID, channel, station count), and mode-specific information
 - **Mode toggle** — clicking "Serial Interface" prompts for SSID/password;
   clicking "WiFi-Testing" switches back immediately
 - **Activity Log** — scrollable log panel showing timestamped entries for
-  hotplug events, WiFi tester operations (sta_join, sta_leave, scan, HTTP
+  hotplug events, WiFi workbench operations (sta_join, sta_leave, scan, HTTP
   relay), and enter-portal sequence steps.  Entries are categorised (info,
   ok, error, step) with colour coding.  "Enter Captive Portal" button
   triggers `POST /api/enter-portal` to connect to a DUT's captive portal
@@ -1320,7 +1320,7 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
 ### 6.4 WiFi Mutual Exclusivity
 
 - AP and STA are mutually exclusive — starting one stops the other
-- Mode guard prevents tester endpoints from running in serial-interface mode;
+- Mode guard prevents workbench endpoints from running in serial-interface mode;
   guarded endpoints return HTTP 200 with `{"ok": false, "error": "WiFi testing
   disabled (Serial Interface mode)"}`
 
@@ -1350,7 +1350,7 @@ two USB interfaces through a single cable:
 | USB-Serial/JTAG | Espressif `303a:1001` | Flashing (esptool), DTR/RTS reset | **JTAG slot** |
 | USB-to-UART bridge | e.g. CH340 `1a86:55d3`, CP2102 `10c4:ea60` | UART0 console output | **UART slot** |
 
-These boards occupy **two slots** in the tester configuration because the hub
+These boards occupy **two slots** in the workbench configuration because the hub
 presents two independent `ttyACM` (or `ttyUSB`) devices with distinct `ID_PATH`
 values.  Both paths share a common hub parent — e.g. `usb-0:1.1.2:1.0` and
 `usb-0:1.1.4:1.0` both descend from the hub at `usb-0:1.1`.
@@ -1400,7 +1400,7 @@ reset and boot mode via DTR/RTS on the USB-Serial/JTAG interface, making
 external GPIO wiring unnecessary.  Single-USB boards **may or may not**
 have GPIO wires connected.
 
-The tester can auto-detect whether a board responds to Pi GPIO control
+The workbench can auto-detect whether a board responds to Pi GPIO control
 using a two-step probe:
 
 #### Probe Algorithm
@@ -1474,7 +1474,7 @@ Step 2: Try USB DTR/RTS reset (fallback)
 | TC-007 | Boot persistence | Same slots get same ports after reboot |
 | TC-008 | Unknown slot | Portal logs "unknown slot_key", no crash |
 
-### 7.2 WiFi Tester Tests
+### 7.2 WiFi Workbench Tests
 
 Tests are implemented in `pytest/test_instrument.py` and run via:
 ```
@@ -1567,10 +1567,10 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 1.2 | 2026-02-05 | Claude | Testing complete for serial-based approach |
 | 2.0 | 2026-02-05 | Claude | Major rewrite: event-driven slot-based architecture |
 | 3.0 | 2026-02-05 | Claude | Portal v3: direct hotplug handling, in-memory seq + locking, systemd-run udev |
-| 4.0 | 2026-02-07 | Claude | WiFi Tester integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
+| 4.0 | 2026-02-07 | Claude | WiFi Workbench integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
 | 5.0 | 2026-02-07 | Claude | ESP32-C3 native USB support: FR-006 (ttyACM handling, plain RFC2217 server, controlled boot sequence, USB reset types, flashing via SSH), FR-007 (USB flap detection), updated edge cases and device settle checks |
 | 5.1 | 2026-02-08 | Claude | plain_rfc2217_server for ALL devices (ttyACM and ttyUSB); esp_rfc2217_server deprecated; flashing via RFC2217 works for both chip types (no SSH needed); updated proxy selection, flashing docs, deliverables |
-| 5.3 | 2026-02-08 | Claude | Activity log system (`GET /api/log`, `POST /api/enter-portal` for captive portal trigger via rapid resets); WiFi tester fixes (stale wpa_supplicant socket cleanup, `ctrl_interface=` in wpa_passphrase output, `dhcpcd` DHCP client support); activity logging for hotplug events and WiFi tester operations; activity log UI panel with colour-coded entries |
+| 5.3 | 2026-02-08 | Claude | Activity log system (`GET /api/log`, `POST /api/enter-portal` for captive portal trigger via rapid resets); WiFi workbench fixes (stale wpa_supplicant socket cleanup, `ctrl_interface=` in wpa_passphrase output, `dhcpcd` DHCP client support); activity logging for hotplug events and WiFi workbench operations; activity log UI panel with colour-coded entries |
 | 5.2 | 2026-02-08 | Claude | Removed esp_rfc2217_server.py and serial_proxy.py (no longer installed); proxy auto-restart after esptool USB re-enumeration (background stop_proxy, BrokenPipeError fix, curl timeout 10s); FR-004 logging removed; updated deliverables |
 | 6.0 | 2026-02-08 | Claude | Service separation — Serial and WiFi as independent services with state models (§1.6); serial reset (FR-008) and serial monitor (FR-009) as first-class API operations; flapping recovery via active reset; WiFi section renamed to WiFi Service with states Idle/Captive/AP; enter-portal rewritten as composite serial operation; consolidated API table (FR-010) |
 | 6.1 | 2026-02-09 | Claude | Human interaction request (FR-017): blocking endpoint for test steps requiring physical operator actions; pulsing orange UI modal; ThreadingHTTPServer for concurrent requests; driver `human_interaction()` method; WT-700–703 test cases |
@@ -1764,7 +1764,7 @@ WantedBy=multi-user.target
 | DHCP_RANGE_START | `192.168.4.2` |
 | DHCP_RANGE_END | `192.168.4.20` |
 | DHCP_LEASE_TIME | `1h` |
-| WORK_DIR | `/tmp/wifi-tester` |
+| WORK_DIR | `/tmp/wifi-workbench` |
 | VERSION | `1.0.0-pi` |
 
 ---
@@ -1836,13 +1836,13 @@ Add this to /etc/rfc2217/slots.json:
 - [x] TASK-021: Add WiFi API routes to portal.py
 - [x] TASK-022: Implement mode switching (wifi-testing / serial-interface)
 - [x] TASK-023: Create wifi-lease-notify.sh for dnsmasq callbacks
-- [x] TASK-024: Create wifi_tester_driver.py (HTTP test driver)
+- [x] TASK-024: Create esp32_workbench_driver.py (HTTP test driver)
 - [x] TASK-025: Create conftest.py + test_instrument.py (WT-xxx tests)
 - [x] TASK-026: Add WiFi section to web UI with mode toggle
 - [x] TASK-027: Activity log system (deque, `log_activity()`, `GET /api/log`)
 - [x] TASK-028: Enter-portal endpoint (`POST /api/enter-portal`, rapid-reset via serial)
 - [x] TASK-029: Activity log UI panel with enter-portal button
-- [x] TASK-040: WiFi Tester stale wpa_supplicant socket cleanup
+- [x] TASK-040: WiFi Workbench stale wpa_supplicant socket cleanup
 - [x] TASK-041: wpa_passphrase ctrl_interface fix for wpa_cli compatibility
 
 **Human Interaction (v6.1):**
@@ -1850,32 +1850,32 @@ Add this to /etc/rfc2217/slots.json:
 - [x] TASK-061: Implement `GET /api/human/status`, `POST /api/human/done`, `POST /api/human/cancel`
 - [x] TASK-062: Human interaction modal in web UI (pulsing orange overlay, Done/Cancel)
 - [x] TASK-063: Switch to `ThreadingHTTPServer` for concurrent request handling
-- [x] TASK-064: Add `human_interaction()` method to `wifi_tester_driver.py`
+- [x] TASK-064: Add `human_interaction()` method to `esp32_workbench_driver.py`
 - [x] TASK-065: Add `Cache-Control: no-cache` to UI HTML response
 
 **GPIO Control (v6.2):**
 - [x] TASK-070: Implement `POST /api/gpio/set` with pin allowlist and gpiod v2 API (FR-018)
 - [x] TASK-071: Implement `GET /api/gpio/status` for active pin readback (FR-018)
-- [x] TASK-072: Add `gpio_set()` and `gpio_get()` methods to `wifi_tester_driver.py`
+- [x] TASK-072: Add `gpio_set()` and `gpio_get()` methods to `esp32_workbench_driver.py`
 - [ ] TASK-073: Implement WT-800–806 GPIO test cases in `test_instrument.py`
 
 **Test Progress (v6.2):**
 - [x] TASK-080: Implement `POST /api/test/update` and `GET /api/test/progress` (FR-019)
 - [x] TASK-081: Test progress panel in web UI (progress bar, current step, results)
-- [x] TASK-082: Add `test_start/step/result/end()` methods to `wifi_tester_driver.py`
+- [x] TASK-082: Add `test_start/step/result/end()` methods to `esp32_workbench_driver.py`
 - [ ] TASK-083: Implement WT-900–903 test progress test cases
 
 **UDP Log Receiver (v7.0):**
 - [ ] TASK-090: Implement UDP socket listener thread in portal.py (FR-020)
 - [ ] TASK-091: Implement `GET /api/udplog` and `DELETE /api/udplog` endpoints
-- [ ] TASK-092: Add `udplog()` and `udplog_clear()` methods to `wifi_tester_driver.py`
+- [ ] TASK-092: Add `udplog()` and `udplog_clear()` methods to `esp32_workbench_driver.py`
 - [ ] TASK-093: Implement WT-1000–1005 UDP log test cases
 
 **OTA Firmware Repository (v7.0):**
 - [ ] TASK-100: Create firmware directory and path-safe file serving (FR-021)
 - [ ] TASK-101: Implement `GET /firmware/<project>/<filename>` binary serving
 - [ ] TASK-102: Implement `GET /api/firmware/list`, `POST /api/firmware/upload`, `DELETE /api/firmware/delete`
-- [ ] TASK-103: Add `firmware_list/upload/delete()` methods to `wifi_tester_driver.py`
+- [ ] TASK-103: Add `firmware_list/upload/delete()` methods to `esp32_workbench_driver.py`
 - [ ] TASK-104: Update install.sh to create firmware directory
 - [ ] TASK-105: Implement WT-1100–1105 firmware test cases
 
@@ -1885,7 +1885,7 @@ Add this to /etc/rfc2217/slots.json:
 - [ ] TASK-112: Implement BLE connect/disconnect with state tracking
 - [ ] TASK-113: Implement BLE write to GATT characteristic
 - [ ] TASK-114: Add BLE API routes to portal.py (`/api/ble/*`)
-- [ ] TASK-115: Add `ble_scan/connect/disconnect/status/write()` methods to `wifi_tester_driver.py`
+- [ ] TASK-115: Add `ble_scan/connect/disconnect/status/write()` methods to `esp32_workbench_driver.py`
 - [ ] TASK-116: Update install.sh to install bleak dependency
 - [ ] TASK-117: Implement WT-1200–1207 BLE proxy test cases
 
@@ -1905,6 +1905,6 @@ Add this to /etc/rfc2217/slots.json:
 | `99-rfc2217-hotplug.rules` | udev rules using systemd-run to invoke notify script |
 | `rfc2217-portal.service` | systemd unit for the portal |
 | `slots.json` | Slot configuration file |
-| `wifi_tester_driver.py` | HTTP driver for running WT-xxx tests against the instrument |
-| `conftest.py` | Pytest fixtures (`wifi_tester`, `wifi_network`, `--wt-url`, `--run-dut`) |
+| `esp32_workbench_driver.py` | HTTP driver for running WT-xxx tests against the instrument |
+| `conftest.py` | Pytest fixtures (`esp32_workbench`, `wifi_network`, `--wt-url`, `--run-dut`) |
 | `test_instrument.py` | Self-tests (WT-100 through WT-1207) |

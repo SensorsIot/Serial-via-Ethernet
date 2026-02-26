@@ -1,6 +1,6 @@
 ---
-name: esp32-tester-wifi
-description: WiFi AP/STA control, scanning, HTTP relay, and captive portal provisioning for the Universal ESP32 Tester. Triggers on "wifi", "AP", "station", "scan", "provision", "captive portal", "enter-portal", "HTTP relay".
+name: esp32-workbench-wifi
+description: WiFi AP/STA control, scanning, HTTP relay, and captive portal provisioning for the Universal ESP32 Workbench. Triggers on "wifi", "AP", "station", "scan", "provision", "captive portal", "enter-portal", "HTTP relay".
 ---
 
 # ESP32 WiFi & Provisioning
@@ -17,9 +17,9 @@ Base URL: `http://192.168.0.87:8080`
 | POST | `/api/wifi/sta_join` | Join an existing WiFi network as station |
 | POST | `/api/wifi/sta_leave` | Disconnect from WiFi network |
 | GET | `/api/wifi/scan` | Scan for nearby WiFi networks |
-| POST | `/api/wifi/http` | HTTP relay — make HTTP requests via tester's network |
+| POST | `/api/wifi/http` | HTTP relay — make HTTP requests via workbench's network |
 | GET | `/api/wifi/events` | Long-poll for STA_CONNECT / STA_DISCONNECT events |
-| POST | `/api/enter-portal` | Ensure device is on tester AP — provision via captive portal if needed |
+| POST | `/api/enter-portal` | Ensure device is on workbench AP — provision via captive portal if needed |
 | GET | `/api/wifi/ping` | Quick connectivity check |
 | POST | `/api/wifi/mode` | Set mode: `wifi-testing` or `serial-interface` |
 | GET | `/api/wifi/mode` | Get current mode |
@@ -52,7 +52,7 @@ curl http://192.168.0.87:8080/api/wifi/scan
 # Long-poll for WiFi events (30s timeout)
 curl "http://192.168.0.87:8080/api/wifi/events?timeout=30"
 
-# HTTP relay — make a GET request through the tester
+# HTTP relay — make a GET request through the workbench
 curl -X POST http://192.168.0.87:8080/api/wifi/http \
   -H 'Content-Type: application/json' \
   -d '{"method": "GET", "url": "http://192.168.4.1/status", "timeout": 10}'
@@ -62,7 +62,7 @@ curl -X POST http://192.168.0.87:8080/api/wifi/http \
   -H 'Content-Type: application/json' \
   -d '{"method": "POST", "url": "http://192.168.4.1/config", "headers": {"Content-Type": "application/json"}, "body": "eyJzc2lkIjoiTXlOZXQifQ==", "timeout": 10}'
 
-# Ensure device is on tester AP (provisions via captive portal if needed)
+# Ensure device is on workbench AP (provisions via captive portal if needed)
 curl -X POST http://192.168.0.87:8080/api/enter-portal \
   -H 'Content-Type: application/json' \
   -d '{"portal_ssid": "iOS-Keyboard-Setup", "ssid": "TestAP", "password": "testpass123"}'
@@ -70,19 +70,19 @@ curl -X POST http://192.168.0.87:8080/api/enter-portal \
 
 ## Common Workflows
 
-1. **Ensure device is connected to tester AP:**
+1. **Ensure device is connected to workbench AP:**
    ```bash
    curl -X POST http://192.168.0.87:8080/api/enter-portal \
      -H 'Content-Type: application/json' \
-     -d '{"portal_ssid": "<device-AP>", "ssid": "<tester-AP>", "password": "<tester-pass>"}'
+     -d '{"portal_ssid": "<device-AP>", "ssid": "<workbench-AP>", "password": "<workbench-pass>"}'
    ```
-   - Starts tester AP if not running
+   - Starts workbench AP if not running
    - If device already has credentials → connects directly
-   - If not → tester joins device's captive portal, fills in its own AP credentials, submits
+   - If not → workbench joins device's captive portal, fills in its own AP credentials, submits
    - Monitor progress via `GET /api/log`
 
 2. **Test device WiFi connectivity:**
-   - `POST /api/enter-portal` — ensure device is on tester AP
+   - `POST /api/enter-portal` — ensure device is on workbench AP
    - `GET /api/wifi/ap_status` — verify device is connected
    - `POST /api/wifi/http` — relay HTTP to DUT's IP to verify it responds
 
@@ -96,6 +96,6 @@ curl -X POST http://192.168.0.87:8080/api/enter-portal \
 |---------|-----|
 | AP won't start | Check that mode is `wifi-testing` via `GET /api/wifi/mode` |
 | STA join timeout | Verify SSID/password; increase timeout |
-| HTTP relay fails | Ensure tester is on same network as target (AP or STA) |
+| HTTP relay fails | Ensure workbench is on same network as target (AP or STA) |
 | enter-portal "already running" | Previous run still active; wait for it to finish |
 | No events from long-poll | DUT may not have connected yet; increase timeout |

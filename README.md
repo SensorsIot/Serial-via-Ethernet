@@ -1,4 +1,4 @@
-# Universal ESP32 Tester
+# Universal ESP32 Workbench
 
 A Raspberry Pi that turns into a complete remote test instrument for ESP32 devices. Plug your boards into its USB hub, and control everything — serial, WiFi, BLE, GPIO, firmware updates — over the network through a single HTTP API.
 
@@ -159,8 +159,8 @@ eth0 carries all management traffic (HTTP API, RFC2217 serial). wlan0 is dedicat
 ### Installation
 
 ```bash
-git clone https://github.com/SensorsIot/Universal-ESP32-Tester.git
-cd Universal-ESP32-Tester/pi
+git clone https://github.com/SensorsIot/Universal-ESP32-Workbench.git
+cd Universal-ESP32-Workbench/pi
 bash install.sh
 ```
 
@@ -220,13 +220,13 @@ monitor_port = rfc2217://192.168.0.87:4001?ign_set_control
 ### pytest Driver
 
 ```bash
-pip install -e Universal-ESP32-Tester/pytest
+pip install -e Universal-ESP32-Workbench/pytest
 ```
 
 ```python
-from wifi_tester_driver import WiFiTesterDriver as ESP32TesterDriver
+from esp32_workbench_driver import ESP32WorkbenchDriver
 
-ut = ESP32TesterDriver("http://192.168.0.87:8080")
+ut = ESP32WorkbenchDriver("http://192.168.0.87:8080")
 
 # Serial
 ut.serial_reset("SLOT2")
@@ -276,10 +276,10 @@ ut.test_end()
 
 ### OTA Firmware Update Workflow
 
-The tester provides a complete end-to-end OTA workflow for ESP32 devices connected via its WiFi AP:
+The workbench provides a complete end-to-end OTA workflow for ESP32 devices connected via its WiFi AP:
 
 ```bash
-# 1. Upload firmware to the tester's OTA repository
+# 1. Upload firmware to the workbench's OTA repository
 curl -X POST http://192.168.0.87:8080/api/firmware/upload \
   -F "project=ios-keyboard" -F "file=@build/ios-keyboard.bin"
 
@@ -289,7 +289,7 @@ curl -o /dev/null -w "%{http_code}" \
   http://192.168.0.87:8080/firmware/ios-keyboard/ios-keyboard.bin
 
 # 3. Trigger OTA on the ESP32 via HTTP relay
-#    (the ESP32 must expose a /ota endpoint and be connected to the tester's AP)
+#    (the ESP32 must expose a /ota endpoint and be connected to the workbench's AP)
 curl -X POST http://192.168.0.87:8080/api/wifi/http \
   -H "Content-Type: application/json" \
   -d '{"method":"POST","url":"http://192.168.4.15/ota"}'
@@ -299,11 +299,11 @@ curl http://192.168.0.87:8080/api/udplog?source=192.168.4.15
 ```
 
 The ESP32 device must:
-- Be connected to the tester's WiFi AP (e.g. via `POST /api/enter-portal`)
+- Be connected to the workbench's WiFi AP (e.g. via `POST /api/enter-portal`)
 - Have an HTTP server with a `POST /ota` endpoint that triggers `esp_ota_ops`
 - Configure its OTA URL to `http://192.168.0.87:8080/firmware/<project>/<file>.bin`
 
-The tester's HTTP relay (`POST /api/wifi/http`) bridges the gap between the LAN network and the WiFi AP network, allowing remote triggering of OTA from any client on the LAN.
+The workbench's HTTP relay (`POST /api/wifi/http`) bridges the gap between the LAN network and the WiFi AP network, allowing remote triggering of OTA from any client on the LAN.
 
 ### curl Examples
 
@@ -456,19 +456,19 @@ pi/
   systemd/                   Service unit file
 
 pytest/
-  wifi_tester_driver.py      Python test driver (WiFiTesterDriver class)
+  esp32_workbench_driver.py      Python test driver (ESP32WorkbenchDriver class)
   conftest.py                Fixtures and CLI options
   test_instrument.py         Self-tests for the instrument
 
 docs/
-  Universal-ESP32-Tester-FSD.md  Full functional specification
+  Universal-ESP32-Workbench-FSD.md  Full functional specification
 ```
 
 ---
 
 ## Claude Code Skills
 
-The tester comes with Claude Code skills that let an AI agent operate the tester via curl. Each skill covers one domain and includes endpoints, curl examples, prerequisites, and troubleshooting.
+The workbench comes with Claude Code skills that let an AI agent operate the workbench via curl. Each skill covers one domain and includes endpoints, curl examples, prerequisites, and troubleshooting.
 
 ### Installing Skills
 
@@ -477,26 +477,26 @@ Copy the skills into your project's `.claude/skills/` directory so Claude Code c
 ```bash
 # From your ESP32 project root
 mkdir -p .claude/skills
-git clone https://github.com/SensorsIot/Universal-ESP32-Tester.git /tmp/esp32-tester
-cp -r /tmp/esp32-tester/.claude/skills/esp32-tester-* .claude/skills/
-rm -rf /tmp/esp32-tester
+git clone https://github.com/SensorsIot/Universal-ESP32-Workbench.git /tmp/esp32-workbench
+cp -r /tmp/esp32-workbench/.claude/skills/esp32-workbench-* .claude/skills/
+rm -rf /tmp/esp32-workbench
 ```
 
 ### After Installing: Enhance Your FSD
 
-The `esp32-tester-fsd-writer` skill is a procedure that reads your project's FSD and adds a testing chapter — how to verify each feature using the tester, with exact curl commands and success criteria. Ask Claude: *"enhance the FSD with tester integration"*.
+The `esp32-workbench-fsd-writer` skill is a procedure that reads your project's FSD and adds a testing chapter — how to verify each feature using the workbench, with exact curl commands and success criteria. Ask Claude: *"enhance the FSD with workbench integration"*.
 
 ### Available Skills
 
 | Skill | Triggers on | Purpose |
 |-------|-------------|---------|
-| `esp32-tester-serial` | serial, reset, monitor, flash, esptool | Device discovery, serial reset/monitor, RFC2217 flashing |
-| `esp32-tester-wifi` | wifi, AP, station, scan, provision | WiFi AP/STA, HTTP relay, captive portal provisioning |
-| `esp32-tester-ota` | OTA, firmware, upload, update | Firmware upload/list/delete, OTA update workflow |
-| `esp32-tester-ble` | BLE, bluetooth, GATT, NUS | BLE scan, connect, GATT write |
-| `esp32-tester-gpio` | GPIO, pin, boot mode, button | Drive Pi GPIO pins for boot mode control |
-| `esp32-tester-udplog` | UDP log, debug log, remote log | Retrieve/clear UDP debug logs, activity log |
-| `esp32-tester-fsd-writer` | FSD, enhance FSD, add testing | Reads your FSD and adds a testing chapter with tester procedures |
+| `esp32-workbench-serial` | serial, reset, monitor, flash, esptool | Device discovery, serial reset/monitor, RFC2217 flashing |
+| `esp32-workbench-wifi` | wifi, AP, station, scan, provision | WiFi AP/STA, HTTP relay, captive portal provisioning |
+| `esp32-workbench-ota` | OTA, firmware, upload, update | Firmware upload/list/delete, OTA update workflow |
+| `esp32-workbench-ble` | BLE, bluetooth, GATT, NUS | BLE scan, connect, GATT write |
+| `esp32-workbench-gpio` | GPIO, pin, boot mode, button | Drive Pi GPIO pins for boot mode control |
+| `esp32-workbench-udplog` | UDP log, debug log, remote log | Retrieve/clear UDP debug logs, activity log |
+| `esp32-workbench-fsd-writer` | FSD, enhance FSD, add testing | Reads your FSD and adds a testing chapter with workbench procedures |
 
 ---
 

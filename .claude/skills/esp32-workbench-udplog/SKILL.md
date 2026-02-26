@@ -1,6 +1,6 @@
 ---
-name: esp32-tester-udplog
-description: UDP debug log retrieval from ESP32 devices and tester activity log. Triggers on "UDP log", "debug log", "ESP32 log", "remote log", "activity log".
+name: esp32-workbench-udplog
+description: UDP debug log retrieval from ESP32 devices and workbench activity log. Triggers on "UDP log", "debug log", "ESP32 log", "remote log", "activity log".
 ---
 
 # ESP32 UDP Debug Logging
@@ -17,8 +17,8 @@ Base URL: `http://192.168.0.87:8080`
 - You want to **poll repeatedly** without blocking any slot
 
 ### Prerequisites:
-1. Device firmware must **send UDP datagrams** to tester IP on port **5555**
-2. Device must have **WiFi connectivity** to the tester (AP or same LAN)
+1. Device firmware must **send UDP datagrams** to workbench IP on port **5555**
+2. Device must have **WiFi connectivity** to the workbench (AP or same LAN)
 
 ### Do NOT use UDP logs when:
 - Device has **no WiFi** yet (pre-provisioning, boot phase) — use serial monitor instead
@@ -43,7 +43,7 @@ Base URL: `http://192.168.0.87:8080`
 |--------|------|---------|
 | GET | `/api/udplog` | Retrieve UDP log lines (filter by source, since, limit) |
 | DELETE | `/api/udplog` | Clear the UDP log buffer |
-| GET | `/api/log` | Tester activity log (portal actions, not device logs) |
+| GET | `/api/log` | Workbench activity log (portal actions, not device logs) |
 
 ## UDP Log Examples
 
@@ -65,7 +65,7 @@ Response format: `{"ok": true, "lines": [{"ts": 1700000001.23, "source": "192.16
 
 ## Activity Log Examples
 
-The activity log tracks tester actions (resets, WiFi changes, firmware uploads) — not device output.
+The activity log tracks workbench actions (resets, WiFi changes, firmware uploads) — not device output.
 
 ```bash
 # Get all activity entries
@@ -77,13 +77,13 @@ curl -s "http://192.168.0.87:8080/api/log?since=2025-01-01T00:00:00Z" | jq .
 
 ## How ESP32 Sends UDP Logs
 
-The tester listens on UDP port **5555**. ESP32 firmware sends plain text lines:
+The workbench listens on UDP port **5555**. ESP32 firmware sends plain text lines:
 
 ```c
-// ESP-IDF: send log line to tester
-struct sockaddr_in tester = { .sin_family = AF_INET, .sin_port = htons(5555) };
-inet_aton("192.168.0.87", &tester.sin_addr);
-sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&tester, sizeof(tester));
+// ESP-IDF: send log line to workbench
+struct sockaddr_in workbench = { .sin_family = AF_INET, .sin_port = htons(5555) };
+inet_aton("192.168.0.87", &workbench.sin_addr);
+sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&workbench, sizeof(workbench));
 ```
 
 Each line is stored with timestamp + source IP. Buffer holds ~10000 lines.
@@ -92,7 +92,7 @@ Each line is stored with timestamp + source IP. Buffer holds ~10000 lines.
 
 1. **Monitor OTA progress:**
    - `DELETE /api/udplog` — clear buffer
-   - Trigger OTA (see esp32-tester-ota)
+   - Trigger OTA (see esp32-workbench-ota)
    - Poll: `GET /api/udplog?since=<last_ts>&limit=50`
    - Repeat polling until you see completion message
 
@@ -108,8 +108,8 @@ Each line is stored with timestamp + source IP. Buffer holds ~10000 lines.
 
 | Problem | Fix |
 |---------|-----|
-| No UDP logs appearing | Ensure firmware sends UDP to tester IP:5555; check WiFi connectivity |
+| No UDP logs appearing | Ensure firmware sends UDP to workbench IP:5555; check WiFi connectivity |
 | Logs from wrong device | Use `source` query param to filter by IP |
 | Old/stale logs | Clear with `DELETE /api/udplog` before starting a test |
-| Need boot output | UDP logs don't capture boot — use serial monitor (esp32-tester-serial). For dual-USB hub boards, monitor the UART slot (not the JTAG slot) |
+| Need boot output | UDP logs don't capture boot — use serial monitor (esp32-workbench-serial). For dual-USB hub boards, monitor the UART slot (not the JTAG slot) |
 | Need pattern matching | Poll UDP logs manually; or use serial monitor which has built-in regex matching |

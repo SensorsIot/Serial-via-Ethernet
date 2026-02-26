@@ -1,6 +1,6 @@
 ---
-name: esp32-tester-serial
-description: Serial device discovery, reset, monitor, and flashing for the Universal ESP32 Tester. Triggers on "serial", "reset", "monitor", "device", "slot", "NVS", "erase", "flash", "esptool".
+name: esp32-workbench-serial
+description: Serial device discovery, reset, monitor, and flashing for the Universal ESP32 Workbench. Triggers on "serial", "reset", "monitor", "device", "slot", "NVS", "erase", "flash", "esptool".
 ---
 
 # ESP32 Serial & Device Discovery
@@ -16,7 +16,7 @@ Base URL: `http://192.168.0.87:8080`
 - Device has **no WiFi connectivity**
 - **Prerequisite:** slot state must be `idle` (device present, USB connected)
 - **Blocks:** stops the RFC2217 proxy during flash; no serial monitor while flashing
-- **Alternative:** if device already runs OTA-capable firmware and is on WiFi, use OTA instead (see esp32-tester-ota) — it's faster and doesn't block serial
+- **Alternative:** if device already runs OTA-capable firmware and is on WiFi, use OTA instead (see esp32-workbench-ota) — it's faster and doesn't block serial
 
 ### Serial Monitor — use when:
 - You need **boot messages** (before WiFi is up)
@@ -25,7 +25,7 @@ Base URL: `http://192.168.0.87:8080`
 - You want **crash/panic output** from the UART
 - **Prerequisite:** slot must be `idle` and proxy must be `running`
 - **Blocks:** sets slot state to `monitoring` — only one monitor session per slot at a time
-- **Alternative:** if device is on WiFi and sends UDP logs, use esp32-tester-udplog instead — it's non-blocking, supports multiple devices, and doesn't tie up the serial port
+- **Alternative:** if device is on WiFi and sends UDP logs, use esp32-workbench-udplog instead — it's non-blocking, supports multiple devices, and doesn't tie up the serial port
 
 ## Endpoints
 
@@ -52,13 +52,13 @@ Count how many slots show `present: true`. Then determine the type:
 
 | Present slots | Board type | Reset method | How to identify |
 |---------------|------------|-------------|-----------------|
-| 1 slot | **Single-USB** | Run GPIO probe (see esp32-tester-gpio) to check if Pi GPIOs are wired to EN/BOOT. If not, use DTR/RTS via serial reset. | One `ttyACM`/`ttyUSB` device; same slot for flash + monitor |
+| 1 slot | **Single-USB** | Run GPIO probe (see esp32-workbench-gpio) to check if Pi GPIOs are wired to EN/BOOT. If not, use DTR/RTS via serial reset. | One `ttyACM`/`ttyUSB` device; same slot for flash + monitor |
 | 2 slots (same hub parent) | **Dual-USB hub board** | DTR/RTS on JTAG slot — onboard auto-download circuit, no GPIO needed | Two `ttyACM` devices under a common USB hub path |
 
 **For dual-USB boards**, you must identify which slot is which:
 
 ```bash
-# SSH to tester — check the USB vendor for each present slot's devnode:
+# SSH to workbench — check the USB vendor for each present slot's devnode:
 ssh pi@192.168.0.87 "udevadm info -q property /dev/ttyACM0 | grep ID_SERIAL"
 # Contains "Espressif" → JTAG slot (flash + reset here)
 # Contains "1a86", "CH340", "CP210x" → UART slot (serial console here)
@@ -72,7 +72,7 @@ ssh pi@192.168.0.87 "udevadm info -q property /dev/ttyACM0 | grep ID_SERIAL"
 | **Serial monitor** | The one slot | UART slot |
 | **Reset (DTR/RTS)** | The one slot (or Pi GPIO) | JTAG slot (auto-download circuit) |
 | **Boot output after reset** | The one slot | UART slot (NOT the JTAG slot!) |
-| **GPIO control needed?** | Run GPIO probe to detect (see esp32-tester-gpio) | No (handled by JTAG DTR/RTS) |
+| **GPIO control needed?** | Run GPIO probe to detect (see esp32-workbench-gpio) | No (handled by JTAG DTR/RTS) |
 
 ## Serial Reset
 
@@ -160,7 +160,7 @@ After erasing, the device boots to empty flash (`invalid header: 0xffffffff`) an
 
 These boards contain an onboard USB hub exposing two interfaces:
 
-| Interface | USB ID | Tester role |
+| Interface | USB ID | Workbench role |
 |-----------|--------|-------------|
 | Espressif USB-Serial/JTAG | `303a:1001` | **JTAG slot** — flash + reset |
 | CH340/CP2102 UART bridge | `1a86:55d3` / `10c4:ea60` | **UART slot** — serial console |
@@ -196,7 +196,7 @@ curl -X POST http://192.168.0.87:8080/api/serial/monitor \
 | "proxy not running" | Device may be flapping — check `state` field |
 | Monitor timeout, no output | Baud rate is fixed at 115200; ensure device matches. **For dual-USB boards:** console output goes to the UART slot, not the JTAG slot — make sure you're monitoring the right slot |
 | `flapping` state | USB connection cycling — wait 30s for cooldown |
-| esptool can't connect | Ensure slot is `idle`; for native USB use `--before=usb_reset`; may need GPIO download mode for UART bridge boards (see esp32-tester-gpio) |
+| esptool can't connect | Ensure slot is `idle`; for native USB use `--before=usb_reset`; may need GPIO download mode for UART bridge boards (see esp32-workbench-gpio) |
 | Device crash-looping (`rst:0xc` repeated) | Firmware panic loop — erase flash with `esptool.py --before=usb_reset erase_flash` to break the cycle (works even during crash loops on native USB) |
 | Reset works but no boot output | On dual-USB boards, reset via JTAG slot but boot output appears on UART slot |
 | Board occupies two slots | Onboard USB hub — identify JTAG vs UART via `udevadm info` (see above) |

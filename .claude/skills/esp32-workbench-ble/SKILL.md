@@ -1,6 +1,6 @@
 ---
-name: esp32-tester-ble
-description: Bluetooth LE scanning, connecting, and GATT writes via the Universal ESP32 Tester. Triggers on "BLE", "bluetooth", "GATT", "NUS", "Nordic UART".
+name: esp32-workbench-ble
+description: Bluetooth LE scanning, connecting, and GATT writes via the Universal ESP32 Workbench. Triggers on "BLE", "bluetooth", "GATT", "NUS", "Nordic UART".
 ---
 
 # ESP32 Bluetooth LE Proxy
@@ -71,7 +71,7 @@ curl -X POST http://192.168.0.87:8080/api/ble/disconnect
 
 | Problem | Fix |
 |---------|-----|
-| "BLE not available" | `bleak` not installed on tester Pi |
+| "BLE not available" | `bleak` not installed on workbench Pi |
 | Scan returns empty | Increase timeout; check device is advertising |
 | Connect fails (409) | Already connected — disconnect first |
 | Write fails "invalid hex data" | Data must be hex string (e.g., `"48656c6c6f"` for "Hello") |
