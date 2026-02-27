@@ -22,6 +22,8 @@ Base URL: `http://192.168.0.87:8080`
 | GET | `/api/devices` | List all slots with state, device node, RFC2217 URL |
 | GET | `/api/info` | System info (host IP, hostname, slot counts) |
 | POST | `/api/serial/reset` | Hardware reset via DTR/RTS pulse, returns boot output |
+| POST | `/api/serial/recover` | Manual flap recovery trigger `{"slot": "SLOT1"}` |
+| POST | `/api/serial/release` | Release GPIO after flashing, reboot into firmware `{"slot": "SLOT1"}` |
 
 ## Step 1: Discover Devices and Determine Board Type
 
@@ -116,21 +118,87 @@ esptool.py --port "rfc2217://192.168.0.87:<PORT>?ign_set_control" \
 
 After erasing, the device boots to empty flash and stops looping. Verify with serial reset — should show `rst:0x15 (USB_UART_CHIP_RESET)` and `boot:0x28 (SPI_FAST_FLASH_BOOT)`.
 
-## Flapping
+## Flapping & Automatic Recovery
 
-Empty or corrupt flash can cause USB connection cycling (`flapping` state). The workbench suppresses the RFC2217 proxy during flapping.
+Empty or corrupt flash can cause USB connection cycling (`flapping` state — add/remove every ~3s). The portal now **actively recovers** by unbinding USB at the kernel level to stop the event storm, then recovering the device.
 
-**Recovery:** Wait for flapping to clear (up to 30s), then flash firmware immediately. If the slot stays in `flapping`, the device may need a physical power cycle.
+### How it works
+
+1. **Detection:** 6+ hotplug events in 30s → `flapping` state
+2. **USB unbind:** portal writes to `/sys/bus/usb/drivers/usb/unbind` → storm stops immediately, Pi stays reachable
+3. **Recovery dispatch** (background thread):
+   - **GPIO path** (slots with `gpio_boot`/`gpio_en` in slots.json): hold BOOT LOW → pulse EN → rebind USB → device enumerates in **download mode** (stable)
+   - **No-GPIO path**: exponential backoff (10/20/40/80s), rebind and retry up to 4 times
+4. **Result:** slot enters `download_mode` (GPIO) or retries until stable / flags manual intervention (no-GPIO)
+
+### Recovery with GPIO (automatic)
+
+```
+State flow: flapping → recovering → download_mode → (flash firmware) → idle
+```
+
+After the portal reaches `download_mode`, flash firmware directly on the Pi:
+
+```bash
+ssh pi@192.168.0.87 "python3 -m esptool --chip esp32s3 --port /dev/ttyACM1 \
+  write_flash --flash_mode dio --flash_size 4MB \
+  0x0 /tmp/bootloader.bin 0x8000 /tmp/partition-table.bin \
+  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/app.bin"
+```
+
+Then release GPIO and reboot into firmware:
+
+```bash
+curl -X POST http://192.168.0.87:8080/api/serial/release \
+  -H 'Content-Type: application/json' -d '{"slot": "SLOT1"}'
+```
+
+### Recovery without GPIO (backoff + retry)
+
+```
+State flow: flapping → recovering → idle (if stable) or flapping (retry, up to 4x)
+```
+
+After 4 failed attempts, the slot shows "needs manual intervention".
+
+### Manual recovery trigger
+
+```bash
+curl -X POST http://192.168.0.87:8080/api/serial/recover \
+  -H 'Content-Type: application/json' -d '{"slot": "SLOT1"}'
+```
+
+Resets retry counter and starts a fresh recovery cycle. Works even when not currently flapping.
+
+### `/api/devices` recovery fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `recovering` | bool | USB unbound, recovery in progress |
+| `recover_retries` | int | No-GPIO retry counter |
+| `has_gpio` | bool | Slot has `gpio_boot` configured |
+| `gpio_boot` | int/null | Pi BCM pin wired to ESP32 BOOT/GPIO0 |
+| `gpio_en` | int/null | Pi BCM pin wired to ESP32 EN/RST |
+
+### GPIO pin configuration (slots.json)
+
+```json
+{"label": "SLOT1", "slot_key": "...", "tcp_port": 4001, "gpio_boot": 18, "gpio_en": 17}
+```
+
+Slots without `gpio_boot`/`gpio_en` use the no-GPIO backoff path.
 
 ## Slot States
 
 | State | Meaning | Can flash? |
 |-------|---------|------------|
 | `absent` | No USB device | No |
-| `idle` | Ready | Yes |
+| `idle` | Ready | Yes (via RFC2217) |
 | `resetting` | Reset in progress | No |
 | `monitoring` | Monitor active | No |
-| `flapping` | USB storm | No (wait 30s) |
+| `flapping` | USB storm, recovery failed or pending | No |
+| `recovering` | USB unbound, recovery in progress | No |
+| `download_mode` | GPIO holding BOOT LOW, device stable in bootloader | Yes (direct serial on Pi) |
 
 ## Serial Reset
 
@@ -149,7 +217,9 @@ Response: `{"ok": true, "output": ["line1", "line2", ...]}`
 1. **Flash a blank device:** `GET /api/devices` to find slot URL → `esptool.py --port <url> write_flash ...`
 2. **Flash via GPIO download mode:** enter download mode (see esp32-workbench-gpio) → wait 5s → `esptool.py --before=no_reset write_flash ...`
 3. **Recover crash-looping device:** `esptool.py --before=usb_reset erase_flash` → then flash working firmware
-4. **Recover flapping device:** wait for flapping to clear → flash firmware immediately
+4. **Recover flapping device (GPIO):** wait for `download_mode` state → flash on Pi → `POST /api/serial/release`
+5. **Recover flapping device (no GPIO):** wait for backoff to stabilize, or `POST /api/serial/recover` to retry
+6. **Manual recovery trigger:** `POST /api/serial/recover {"slot": "SLOT1"}` — works anytime
 
 ## Troubleshooting
 
@@ -157,7 +227,10 @@ Response: `{"ok": true, "output": ["line1", "line2", ...]}`
 |---------|-----|
 | Slot shows `absent` | Check USB cable, re-seat device |
 | "proxy not running" | Device may be flapping — check `state` field |
-| `flapping` state | USB connection cycling — wait 30s for cooldown |
+| `flapping` state | Recovery should start automatically; if stuck, `POST /api/serial/recover` |
+| `recovering` state | USB unbound, recovery in progress — wait for `download_mode` or `idle` |
+| `download_mode` state | Flash firmware on the Pi, then `POST /api/serial/release` |
+| "needs manual intervention" | No-GPIO recovery exhausted 4 retries — add GPIO wiring or re-flash manually |
 | esptool can't connect | Ensure slot is `idle`; for native USB use `--before=usb_reset` |
 | esptool fails after GPIO download mode | Wait 5s for USB re-enumeration before connecting; use `--before=no_reset` |
 | Device crash-looping (`rst:0xc` repeated) | Erase flash with `esptool.py --before=usb_reset erase_flash` |

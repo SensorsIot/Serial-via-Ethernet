@@ -105,7 +105,7 @@ Two additional services support automated test workflows:
 ### 8. Web Portal
 
 A browser-based dashboard at **http://pi-ip:8080** showing:
-- Serial slot status (running/empty/flapping)
+- Serial slot status (running/empty/flapping/recovering/download mode)
 - WiFi AP/STA state and connected stations
 - Activity log with color-coded entries
 - Test progress panel
@@ -354,6 +354,9 @@ curl -X POST http://192.168.0.87:8080/api/ble/disconnect
 | Connection refused on serial port | Proxy not running | Check portal at :8080; verify device is plugged in |
 | Timeout during flash | Network latency over RFC2217 | Use `esptool --no-stub` for reliability |
 | Port busy | Another client connected | Close the other connection first (RFC2217 = 1 client) |
+| USB flapping (rapid connect/disconnect) | Erased/corrupt flash, boot loop | Portal auto-recovers: unbinds USB, enters download mode via GPIO. Check slot state in `/api/devices`. Manual trigger: `POST /api/serial/recover` |
+| Slot stuck in `recovering` | Recovery thread running | Wait for `download_mode` (GPIO) or `idle` (no-GPIO). Takes 10-80s depending on retry count |
+| Slot in `download_mode` | Device waiting in bootloader | Flash firmware on Pi, then `POST /api/serial/release` to reboot |
 | ESP32-C3 stuck in download mode | DTR asserted on port open | Use `--after=watchdog-reset` with esptool, never `hard-reset` |
 | DUT not connecting to AP | Wrong WiFi credentials in DUT | Verify AP is running: `curl .../api/wifi/ap_status` |
 | BLE scan finds nothing | Bluetooth powered off | `sudo rfkill unblock bluetooth && sudo hciconfig hci0 up && sudo bluetoothctl power on` |
@@ -376,6 +379,8 @@ curl -X POST http://192.168.0.87:8080/api/ble/disconnect
 | POST | `/api/stop` | Manually stop proxy for a slot |
 | POST | `/api/serial/reset` | Reset device via DTR/RTS |
 | POST | `/api/serial/monitor` | Read serial output with pattern match |
+| POST | `/api/serial/recover` | Manual flap recovery trigger `{"slot"}` |
+| POST | `/api/serial/release` | Release GPIO after flashing, reboot into firmware `{"slot"}` |
 | POST | `/api/enter-portal` | Connect to DUT's captive portal SoftAP, submit WiFi creds, start local AP `{"portal_ssid?", "ssid", "password?"}` |
 
 ### WiFi

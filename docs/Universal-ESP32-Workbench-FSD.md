@@ -124,7 +124,9 @@ its own state machine.  Serial operates per slot; WiFi operates on wlan0.
 | Flashing | External tool (esptool) using RFC2217 proxy — reset/monitor blocked |
 | Resetting | DTR/RTS reset in progress — proxy stopped, direct serial in use |
 | Monitoring | Reading serial output for pattern matching |
-| Flapping | USB connect/disconnect cycling detected — needs recovery |
+| Flapping | USB connect/disconnect cycling detected — recovery failed or pending |
+| Recovering | USB unbound, recovery in progress (GPIO or backoff) |
+| Download Mode | GPIO holding BOOT LOW, device stable in bootloader — ready to flash |
 
 State transitions:
 
@@ -139,7 +141,12 @@ State transitions:
 | Idle | Monitoring | `POST /api/serial/monitor` — reads serial via RFC2217 (non-exclusive) |
 | Monitoring | Idle | Pattern matched or timeout expired |
 | Idle | Flapping | 6+ hotplug events in 30s |
-| Flapping | Idle | Recovery reset succeeds or cooldown expires |
+| Flapping | Recovering | Active recovery started (USB unbind) |
+| Recovering | Download Mode | GPIO recovery succeeds (BOOT held LOW) |
+| Recovering | Idle | No-GPIO rebind succeeds (device stable) |
+| Recovering | Flapping | No-GPIO rebind fails (flapping resumes, up to 4 retries) |
+| Download Mode | Idle | `POST /api/serial/release` (BOOT released, EN pulsed) |
+| Flapping | Idle | Cooldown expires passively (fallback) |
 
 **WiFi Service (wlan0):**
 
@@ -547,67 +554,120 @@ Uses the RFC2217 proxy (non-exclusive) so the proxy stays running.
 
 **Used by:** flapping recovery (FR-007), test verification
 
-### FR-007 — USB Flap Detection
+### FR-007 — USB Flap Detection & Recovery
 
 When a device enters a boot loop (crash → reboot → crash every ~2-3s), the
 Pi sees rapid USB connect/disconnect cycles.  Without protection, the portal
-spawns a new proxy thread for every "add" event, overwhelming the system.
+spawns a new proxy thread for every "add" event, and the udev event flood
+(246+ disconnects observed) can make a 416MB Pi unreachable via SSH.
 
 #### 7.1 Detection
 
 ```python
 FLAP_WINDOW_S = 30       # Look at events within this window
 FLAP_THRESHOLD = 6       # 6 events in 30s = 3 connect/disconnect cycles
-FLAP_COOLDOWN_S = 30     # Wait 30s of quiet before retrying
+FLAP_COOLDOWN_S = 10     # Cooldown before recovery attempt
+FLAP_MAX_RETRIES = 4     # Max no-GPIO recovery attempts
 ```
 
 Each slot tracks `_event_times[]` — timestamps of recent hotplug events.
 When the count within the window exceeds the threshold, the slot enters
-`flapping=true` state.
+`flapping=true` state and active recovery begins immediately.
 
-#### 7.2 Suppression
+#### 7.2 USB Unbind — Stopping the Storm
 
-While `flapping=true`:
-- Proxy starts are **suppressed** (no new processes spawned)
-- Running proxy is **stopped** (it would die on next disconnect anyway)
-- `last_error` is set to describe the flapping condition
-- `flapping` field is exposed in `/api/devices` JSON
+On flap detection, the portal **unbinds the USB device at the kernel level**
+by writing the sysfs device name (e.g. `1-1.1.2`) to
+`/sys/bus/usb/drivers/usb/unbind`.  This immediately stops the event storm —
+no more udev events, no more hotplug notifications.
 
-#### 7.3 Recovery
+The slot_key (e.g. `platform-3f980000.usb-usb-0:1.1.2:1.0`) is parsed to
+extract the sysfs USB device name using `rfind("usb-")` to skip the
+controller name.
 
-When flapping is detected, the portal attempts active recovery using
-serial reset (FR-008) and serial monitor (FR-009):
+While `_recovering=true`, all hotplug events for the slot are **ignored**
+(early exit in the handler).  This prevents the unbind's own synthetic udev
+remove event from interfering with recovery state.
 
-1. Wait for device to be present (next hotplug `add` event)
-2. Call serial reset (`POST /api/serial/reset`) — stops proxy, sends
-   DTR/RTS pulse, reads initial boot output
-3. Call serial monitor (`POST /api/serial/monitor`) — watch for normal
-   boot indicators (e.g. application startup message)
-4. If device boots normally → clear flapping flag, proxy restarts via
-   hotplug re-enumeration
-5. If boot loop continues (device disconnects again within cooldown) →
-   attempt flash erase recovery (step 6), then re-enter flapping state
-6. **Flash erase recovery (native USB devices):** For `ttyACM` devices
-   (ESP32-S3/C3 with native USB), run `esptool.py --before=usb_reset
-   erase_flash` via the slot's RFC2217 URL.  This works even during a
-   crash loop — esptool catches the device during the brief USB
-   re-enumeration between panic reboots.  After erasing, the device boots
-   to empty flash (`invalid header: 0xffffffff`), stops the USB
-   flapping, and the slot returns to `idle`.  For `ttyUSB` devices (UART
-   bridge), this step is skipped — those require GPIO-based download mode
-   entry or manual intervention.
+#### 7.3 Recovery — GPIO Path
 
-**Fallback:** If no hotplug event arrives within `FLAP_COOLDOWN_S` (30s),
-the flapping flag is cleared passively and normal proxy startup resumes
-on the next hotplug add.
+For slots with `gpio_boot` and optionally `gpio_en` configured in
+`slots.json`, the portal performs automatic GPIO-based recovery:
 
-#### 7.4 Web UI
+1. Wait `FLAP_COOLDOWN_S` (10s) for hardware to settle
+2. Hold BOOT/GPIO0 LOW via `gpio_boot` pin (forces download mode)
+3. Pulse EN/RST via `gpio_en` pin if configured (clean reset)
+4. Rebind USB (`/sys/bus/usb/drivers/usb/bind`) — device enumerates
+   in download mode (stable, no crash loop)
+5. State → `download_mode`; BOOT stays held LOW
 
-Flapping slots display a red "FLAPPING" status badge and a warning message:
-> Device is boot-looping (rapid USB connect/disconnect). Proxy start suppressed
-> until device stabilises.
+The device is now stable in the bootloader.  Flash firmware directly on
+the Pi (the RFC2217 proxy is not running in this state):
 
-Other slots are unaffected and continue operating normally.
+```bash
+ssh pi@192.168.0.87 "python3 -m esptool --chip esp32s3 --port /dev/ttyACM1 \
+  write_flash 0x0 bootloader.bin 0x8000 partition-table.bin \
+  0xf000 ota_data_initial.bin 0x20000 app.bin"
+```
+
+After flashing, release GPIO and reboot:
+
+```
+POST /api/serial/release {"slot": "SLOT1"}
+```
+
+This sets BOOT to high-Z (input with pull-up), pulses EN for a clean
+reboot, and transitions the slot back to `idle`.
+
+#### 7.4 Recovery — No-GPIO Path
+
+For slots without GPIO pins, the portal uses exponential backoff:
+
+1. Wait with exponential delay: 10s, 20s, 40s, 80s (per retry)
+2. Clear `_recovering`, rebind USB
+3. If flapping resumes → hotplug handler detects → another recovery cycle
+4. After `FLAP_MAX_RETRIES` (4) failed attempts → state stays `flapping`
+   with error "needs manual intervention"
+
+#### 7.5 Manual Recovery
+
+```
+POST /api/serial/recover {"slot": "SLOT1"}
+```
+
+Resets the retry counter and starts a fresh recovery cycle.  Works even
+when the slot is not currently flapping.
+
+#### 7.6 API Fields
+
+`/api/devices` exposes per-slot recovery state:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `recovering` | bool | USB unbound, recovery thread running |
+| `recover_retries` | int | No-GPIO attempt counter (0-4) |
+| `has_gpio` | bool | Slot has `gpio_boot` configured |
+| `gpio_boot` | int/null | Pi BCM pin for BOOT/GPIO0 |
+| `gpio_en` | int/null | Pi BCM pin for EN/RST |
+
+#### 7.7 Slot Configuration
+
+```json
+{"label": "SLOT1", "slot_key": "...", "tcp_port": 4001, "gpio_boot": 18, "gpio_en": 17}
+```
+
+`gpio_boot` and `gpio_en` are optional per slot.  Slots without them use
+the no-GPIO backoff path.
+
+#### 7.8 Web UI
+
+| State | Badge | Visual |
+|-------|-------|--------|
+| `flapping` | Red "FLAPPING" | Warning + "Retry Recovery" button |
+| `recovering` | Amber "RECOVERING" (pulsing) | Progress message |
+| `download_mode` | Green "DOWNLOAD MODE" | "Release & Reboot" button |
+
+Polling interval reduced from 2s to 5s to lower load on resource-constrained Pi.
 
 ---
 
@@ -1336,7 +1396,7 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
 | Dual-USB hub board | Board exposes onboard hub with JTAG + UART interfaces — occupies two slots (see §6.6) |
 | Device not ready | Settle checks with timeout, then fail with `last_error` |
 | ttyACM DTR trap | `wait_for_device()` skips `os.open()` for ttyACM; proxy uses controlled boot sequence (FR-006) |
-| Boot loop (USB flapping) | Flap detection suppresses proxy restarts; clears after cooldown (FR-007). To break the loop: `esptool.py --before=usb_reset erase_flash` over RFC2217 (works even during crash loops on native USB devices) |
+| Boot loop (USB flapping) | Portal auto-recovers: unbinds USB, enters download mode via GPIO (FR-007). For slots without GPIO: exponential backoff with 4 retries. Manual trigger: `POST /api/serial/recover` |
 | ESP32-C3 stuck in download mode | Run esptool on Pi with `--after=watchdog-reset` to trigger system reset (FR-006.6) |
 | udev PrivateNetwork blocking curl | udev runs RUN+ handlers in a network-isolated sandbox (`PrivateNetwork=yes`). Direct `curl` to localhost silently fails. Fix: wrap the notify script with `systemd-run --no-block` in the udev rule so it runs outside the sandbox. |
 
