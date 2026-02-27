@@ -629,6 +629,9 @@ For slots without GPIO pins, the portal uses exponential backoff:
 3. If flapping resumes → hotplug handler detects → another recovery cycle
 4. After `FLAP_MAX_RETRIES` (2) failed attempts → state stays `flapping`
    with error "needs manual intervention"
+5. Flash directly on the Pi (`esptool --before=usb_reset write_flash ...`)
+6. Once booted, flapping flag auto-clears on next `/api/devices` poll
+   (stale events age out of `_event_times` within `FLAP_WINDOW_S`)
 
 #### 7.5 Manual Recovery
 

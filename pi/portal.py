@@ -554,6 +554,21 @@ def _refresh_slot_health(slot: dict):
 
 def _slot_info(slot: dict) -> dict:
     """Return a JSON-safe copy of a slot (excludes _lock, promotes _recovering/_recover_retries)."""
+    # Clear stale flapping: if no events in the last FLAP_WINDOW_S, the device
+    # has stabilised. This handles the case where the device stops cycling and
+    # no new hotplug event arrives to trigger the in-handler quiet-period check.
+    if slot["flapping"] and not slot["_recovering"]:
+        now = time.time()
+        recent = [t for t in slot["_event_times"] if now - t < FLAP_WINDOW_S]
+        slot["_event_times"] = recent
+        if len(recent) < FLAP_THRESHOLD:
+            label = slot["label"] or slot["slot_key"][-20:]
+            slot["flapping"] = False
+            slot["last_error"] = None
+            slot["state"] = STATE_IDLE if slot["present"] else STATE_ABSENT
+            print(f'[portal] {label}: flapping cleared (events aged out during poll)', flush=True)
+            log_activity(f"{label}: device stabilised — flapping cleared", "ok")
+
     info = {k: v for k, v in slot.items() if not k.startswith("_")}
     info["recovering"] = slot["_recovering"]
     info["recover_retries"] = slot["_recover_retries"]

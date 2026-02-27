@@ -159,7 +159,17 @@ curl -X POST http://192.168.0.87:8080/api/serial/release \
 State flow: flapping → recovering → idle (if stable) or flapping (retry, up to 2x)
 ```
 
-After 2 failed attempts, the slot shows "needs manual intervention".
+After 2 failed attempts, the slot shows "needs manual intervention". Flash directly on the Pi to fix:
+
+```bash
+ssh pi@192.168.0.87 "python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 \
+  --before=usb_reset --after=hard_reset write_flash \
+  --flash_mode dio --flash_size 4MB \
+  0x0 /tmp/bootloader.bin 0x8000 /tmp/partition-table.bin \
+  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/app.bin"
+```
+
+Once the device boots stable firmware, the flapping flag auto-clears on the next poll (within 5s).
 
 ### Manual recovery trigger
 
@@ -230,7 +240,7 @@ Response: `{"ok": true, "output": ["line1", "line2", ...]}`
 | `flapping` state | Recovery should start automatically; if stuck, `POST /api/serial/recover` |
 | `recovering` state | USB unbound, recovery in progress — wait for `download_mode` or `idle` |
 | `download_mode` state | Flash firmware on the Pi, then `POST /api/serial/release` |
-| "needs manual intervention" | No-GPIO recovery exhausted 4 retries — add GPIO wiring or re-flash manually |
+| "needs manual intervention" | No-GPIO recovery exhausted 2 retries — flash directly on Pi with `esptool --before=usb_reset` |
 | esptool can't connect | Ensure slot is `idle`; for native USB use `--before=usb_reset` |
 | esptool fails after GPIO download mode | Wait 5s for USB re-enumeration before connecting; use `--before=no_reset` |
 | Device crash-looping (`rst:0xc` repeated) | Erase flash with `esptool.py --before=usb_reset erase_flash` |
