@@ -128,7 +128,7 @@ Empty or corrupt flash can cause USB connection cycling (`flapping` state — ad
 2. **USB unbind:** portal writes to `/sys/bus/usb/drivers/usb/unbind` → storm stops immediately, Pi stays reachable
 3. **Recovery dispatch** (background thread):
    - **GPIO path** (slots with `gpio_boot`/`gpio_en` in slots.json): hold BOOT LOW → pulse EN → rebind USB → device enumerates in **download mode** (stable)
-   - **No-GPIO path**: exponential backoff (10/20/40/80s), rebind and retry up to 4 times
+   - **No-GPIO path**: fixed cooldown (10s), rebind and retry up to 2 times
 4. **Result:** slot enters `download_mode` (GPIO) or retries until stable / flags manual intervention (no-GPIO)
 
 ### Recovery with GPIO (automatic)
@@ -156,10 +156,10 @@ curl -X POST http://192.168.0.87:8080/api/serial/release \
 ### Recovery without GPIO (backoff + retry)
 
 ```
-State flow: flapping → recovering → idle (if stable) or flapping (retry, up to 4x)
+State flow: flapping → recovering → idle (if stable) or flapping (retry, up to 2x)
 ```
 
-After 4 failed attempts, the slot shows "needs manual intervention".
+After 2 failed attempts, the slot shows "needs manual intervention".
 
 ### Manual recovery trigger
 
@@ -175,7 +175,7 @@ Resets retry counter and starts a fresh recovery cycle. Works even when not curr
 | Field | Type | Description |
 |-------|------|-------------|
 | `recovering` | bool | USB unbound, recovery in progress |
-| `recover_retries` | int | No-GPIO retry counter |
+| `recover_retries` | int | No-GPIO retry counter (0-2) |
 | `has_gpio` | bool | Slot has `gpio_boot` configured |
 | `gpio_boot` | int/null | Pi BCM pin wired to ESP32 BOOT/GPIO0 |
 | `gpio_en` | int/null | Pi BCM pin wired to ESP32 EN/RST |

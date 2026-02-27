@@ -33,7 +33,7 @@ PROXY_EXE = "/usr/local/bin/plain_rfc2217_server.py"
 FLAP_WINDOW_S = 30       # Look at events within this window
 FLAP_THRESHOLD = 6        # 6 events in 30s = 3 connect/disconnect cycles
 FLAP_COOLDOWN_S = 10      # After flapping, wait before recovery attempt
-FLAP_MAX_RETRIES = 4      # Max no-GPIO recovery attempts before manual intervention
+FLAP_MAX_RETRIES = 2      # Max no-GPIO recovery attempts before manual intervention
 
 # Native USB (ttyACM) boot delay — let ESP32-C3 boot past download-mode window
 # before opening the port (Linux cdc_acm asserts DTR+RTS on open, which triggers
@@ -812,12 +812,11 @@ def _recover_with_gpio(slot: dict, usb_device: str):
 def _recover_without_gpio(slot: dict, usb_device: str):
     """Recovery for boards WITHOUT GPIO pins.
 
-    Uses exponential backoff: unbind, wait, rebind, check if flapping resumes.
-    After FLAP_MAX_RETRIES, marks as needing manual intervention.
+    Unbind, wait fixed cooldown, rebind, check if flapping resumes.
+    After FLAP_MAX_RETRIES, gives up — corrupt flash won't self-heal.
     """
     label = slot["label"] or slot["slot_key"][-20:]
     retry = slot["_recover_retries"]
-    delay = FLAP_COOLDOWN_S * (2 ** retry)  # 10, 20, 40, 80s
 
     if retry >= FLAP_MAX_RETRIES:
         slot["_recovering"] = False
@@ -829,8 +828,8 @@ def _recover_without_gpio(slot: dict, usb_device: str):
         log_activity(f"{label}: {slot['last_error']}", "error")
         return
 
-    log_activity(f"{label}: no-GPIO recovery attempt {retry + 1}/{FLAP_MAX_RETRIES} — waiting {delay}s", "step")
-    time.sleep(delay)
+    log_activity(f"{label}: no-GPIO recovery attempt {retry + 1}/{FLAP_MAX_RETRIES} — waiting {FLAP_COOLDOWN_S}s", "step")
+    time.sleep(FLAP_COOLDOWN_S)
 
     slot["_recover_retries"] = retry + 1
     slot["_recovering"] = False  # Allow hotplug to detect if flapping resumes
@@ -2249,14 +2248,14 @@ function renderSlots(slots) {
         } else if (st === 'download_mode') {
             statusMsg = '<div class="download-info">&#10003; Device in download mode — ready to flash</div>';
             actionBtns = '<div class="slot-actions">' +
-                '<button class="btn-release" onclick="releaseSlot(\'' + label + '\')">Release &amp; Reboot</button>' +
+                '<button class="btn-release" onclick="releaseSlot(\\'' + label + '\\')">Release &amp; Reboot</button>' +
                 '</div>';
         } else if (s.flapping && !s.recovering) {
             statusMsg = '<div class="flap-warning">&#9888; Device is boot-looping.' +
-                (s.recover_retries >= 4 ? ' Needs manual intervention.' : '') +
+                (s.recover_retries >= 2 ? ' Needs manual intervention.' : '') +
                 '</div>';
             actionBtns = '<div class="slot-actions">' +
-                '<button class="btn-recover" onclick="recoverSlot(\'' + label + '\')">Retry Recovery</button>' +
+                '<button class="btn-recover" onclick="recoverSlot(\\'' + label + '\\')">Retry Recovery</button>' +
                 '</div>';
         }
         return `

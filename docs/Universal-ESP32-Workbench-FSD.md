@@ -567,7 +567,7 @@ spawns a new proxy thread for every "add" event, and the udev event flood
 FLAP_WINDOW_S = 30       # Look at events within this window
 FLAP_THRESHOLD = 6       # 6 events in 30s = 3 connect/disconnect cycles
 FLAP_COOLDOWN_S = 10     # Cooldown before recovery attempt
-FLAP_MAX_RETRIES = 4     # Max no-GPIO recovery attempts
+FLAP_MAX_RETRIES = 2     # Max no-GPIO recovery attempts
 ```
 
 Each slot tracks `_event_times[]` — timestamps of recent hotplug events.
@@ -623,10 +623,11 @@ reboot, and transitions the slot back to `idle`.
 
 For slots without GPIO pins, the portal uses exponential backoff:
 
-1. Wait with exponential delay: 10s, 20s, 40s, 80s (per retry)
+1. Wait fixed `FLAP_COOLDOWN_S` (10s) — corrupt flash won't self-heal,
+   so increasing the delay is pointless
 2. Clear `_recovering`, rebind USB
 3. If flapping resumes → hotplug handler detects → another recovery cycle
-4. After `FLAP_MAX_RETRIES` (4) failed attempts → state stays `flapping`
+4. After `FLAP_MAX_RETRIES` (2) failed attempts → state stays `flapping`
    with error "needs manual intervention"
 
 #### 7.5 Manual Recovery
@@ -645,7 +646,7 @@ when the slot is not currently flapping.
 | Field | Type | Description |
 |-------|------|-------------|
 | `recovering` | bool | USB unbound, recovery thread running |
-| `recover_retries` | int | No-GPIO attempt counter (0-4) |
+| `recover_retries` | int | No-GPIO attempt counter (0-2) |
 | `has_gpio` | bool | Slot has `gpio_boot` configured |
 | `gpio_boot` | int/null | Pi BCM pin for BOOT/GPIO0 |
 | `gpio_en` | int/null | Pi BCM pin for EN/RST |
