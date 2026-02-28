@@ -7,6 +7,27 @@ description: Use when the user asks to "flash", "upload", "deploy", or "program"
 
 Flash firmware to ESP32 using ESP-IDF tools.
 
+## Flash Size and Partition Tables
+
+> **Flash size defaults to 4MB.** Use `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y` in
+> `sdkconfig.defaults` and `--flash_size 4MB` with esptool. Only use a
+> different size when the actual flash is known (e.g. `esptool.py flash_id`
+> or from the datasheet).
+
+Partition tables must fit within the flash size. The test firmware provides
+two layouts:
+
+| File | Flash size | App partition size | Use when |
+|------|-----------|-------------------|----------|
+| `partitions-4mb.csv` | 4MB (default) | 1216K | Unknown or 4MB flash |
+| `partitions.csv` | 8MB+ | 1536K | Flash confirmed > 4MB |
+
+Set the partition table in `sdkconfig.defaults`:
+```
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"
+```
+
 ## Local Flash (USB)
 
 ```bash

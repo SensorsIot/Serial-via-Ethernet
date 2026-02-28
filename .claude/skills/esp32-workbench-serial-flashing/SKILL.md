@@ -62,20 +62,18 @@ ssh pi@192.168.0.87 "udevadm info -q property /dev/ttyACM0 | grep ID_SERIAL"
 
 Each slot exposes an RFC2217 URL from `/api/devices`. Use it with esptool.
 
+> **Flash size and partition layout:** see the `idf-flash` skill for the
+> authoritative flash size rule (default 4MB) and partition table selection.
+
 **Baud rate:** Native USB devices (ESP32-S3/C3 `ttyACM`) ignore the baud rate — data transfers at USB speed regardless. The effective throughput is limited by the RFC2217 TCP proxy (~300 kbit/s). UART-bridge devices (`ttyUSB`) respect the baud rate. Use `-b 921600` as a sensible default for both cases.
 
 ```bash
 # Get the RFC2217 URL
 SLOT_URL=$(curl -s http://192.168.0.87:8080/api/devices | jq -r '.slots[0].url')
 
-# Flash firmware (use ?ign_set_control for RFC2217 proxy compatibility)
-esptool.py --port "${SLOT_URL}?ign_set_control" --chip esp32s3 -b 921600 \
-  --before=default_reset --after=hard_reset write_flash \
-  --flash_mode dio --flash_size 4MB --flash_freq 80m \
-  0x0 build/bootloader/bootloader.bin \
-  0x8000 build/partition_table/partition-table.bin \
-  0xf000 build/ota_data_initial.bin \
-  0x20000 build/firmware.bin
+# Flash firmware using build-generated flash_args (recommended)
+cd build && esptool.py --port "${SLOT_URL}?ign_set_control" \
+  --chip esp32s3 -b 921600 write_flash @flash_args
 
 # Erase NVS partition
 esptool.py --port "${SLOT_URL}?ign_set_control" --chip esp32s3 erase_region 0x9000 0x6000
@@ -137,13 +135,15 @@ Empty or corrupt flash can cause USB connection cycling (`flapping` state — ad
 State flow: flapping → recovering → download_mode → (flash firmware) → idle
 ```
 
-After the portal reaches `download_mode`, flash firmware directly on the Pi:
+After the portal reaches `download_mode`, upload build artifacts to the Pi and flash (use flash size matching the board — see `idf-flash` skill):
 
 ```bash
+scp build/bootloader/bootloader.bin build/partition_table/partition-table.bin \
+    build/ota_data_initial.bin build/wb-test-firmware.bin pi@192.168.0.87:/tmp/
 ssh pi@192.168.0.87 "python3 -m esptool --chip esp32s3 --port /dev/ttyACM1 \
   write_flash --flash_mode dio --flash_size 4MB \
   0x0 /tmp/bootloader.bin 0x8000 /tmp/partition-table.bin \
-  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/app.bin"
+  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/wb-test-firmware.bin"
 ```
 
 Then release GPIO and reboot into firmware:
@@ -159,14 +159,14 @@ curl -X POST http://192.168.0.87:8080/api/serial/release \
 State flow: flapping → recovering → idle (if stable) or flapping (retry, up to 2x)
 ```
 
-After 2 failed attempts, the slot shows "needs manual intervention". Flash directly on the Pi to fix:
+After 2 failed attempts, the slot shows "needs manual intervention". Upload build artifacts and flash directly on the Pi:
 
 ```bash
 ssh pi@192.168.0.87 "python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 \
   --before=usb_reset --after=hard_reset write_flash \
   --flash_mode dio --flash_size 4MB \
   0x0 /tmp/bootloader.bin 0x8000 /tmp/partition-table.bin \
-  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/app.bin"
+  0xf000 /tmp/ota_data_initial.bin 0x20000 /tmp/wb-test-firmware.bin"
 ```
 
 Once the device boots stable firmware, the flapping flag auto-clears on the next poll (within 5s).
